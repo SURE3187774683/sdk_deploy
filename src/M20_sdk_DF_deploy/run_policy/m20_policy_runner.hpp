@@ -1,0 +1,393 @@
+/**
+ * @file m20_policy_runner.hpp
+ * @brief m20_policy_runner
+ * @author Bo (Percy) Peng
+ * @version 1.0
+ * @date 2025-11-07
+ * 
+ * @copyright Copyright (c) 2025  DeepRobotics
+ * 
+ */
+
+#pragma once
+#define PI 3.14159265358979323846
+
+#include "policy_runner_base.hpp"
+#include <ctime>
+#include <cmath>
+#include <utility>
+#include <string>
+#include <onnxruntime_cxx_api.h>
+#include <onnxruntime_c_api.h>
+
+class M20PolicyRunner : public PolicyRunnerBase {
+private:
+    VecXf kp_, kd_;
+    VecXf dof_default_eigen_policy, dof_default_eigen_robot;
+    Vec3f max_cmd_vel_, gravity_direction = Vec3f(0., 0., -1.);
+    VecXf dof_pos_default_;
+    timespec system_time;
+
+    const int motor_num = 16;
+    int observation_dim_ = 57;
+    const int action_dim = 16;
+    float agent_timestep = 0.02;
+    float current_time;
+    bool is_fallen = true;
+
+    VecXf joint_pos_rl = VecXf(action_dim);// in rl squenece
+    VecXf joint_vel_rl = VecXf(action_dim);
+    
+    const std::string policy_path_;
+
+    float omega_scale_ = 0.25;
+    float dof_vel_scale_ = 0.05;
+    VecXf imu_w_eigen, base_acc_eigen, motor_p_eigen, motor_v_eigen,
+          current_action_eigen, last_action_eigen, current_observation_, projected_gravity,
+          tmp_action_eigen;
+
+    RobotAction robot_action;
+    std::vector<std::string> robot_order = {
+        "fl_hipx_joint", "fl_hipy_joint", "fl_knee_joint", "fl_wheel_joint",
+        "fr_hipx_joint", "fr_hipy_joint", "fr_knee_joint", "fr_wheel_joint",
+        "hl_hipx_joint", "hl_hipy_joint", "hl_knee_joint", "hl_wheel_joint",
+        "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint", "hr_wheel_joint"};
+
+
+    std::vector<std::string> policy_order = {
+        "fl_hipx_joint", "fl_hipy_joint", "fl_knee_joint",
+        "fr_hipx_joint", "fr_hipy_joint", "fr_knee_joint",
+        "hl_hipx_joint", "hl_hipy_joint", "hl_knee_joint",
+        "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint",
+        "fl_wheel_joint", "fr_wheel_joint", "hl_wheel_joint", "hr_wheel_joint",
+    };
+
+
+    std::vector<float> action_scale_robot = {0.125, 0.25, 0.25, 5,
+                                             0.125, 0.25, 0.25, 5,
+                                             0.125, 0.25, 0.25, 5,
+                                             0.125, 0.25, 0.25, 5};
+
+
+    Ort::SessionOptions session_options_;
+    Ort::Session session_{nullptr};
+    
+    Ort::Env env_;
+    std::vector<int> robot2policy_idx, policy2robot_idx;
+
+    const char* input_names_[1] = {"obs"}; // must keep the same as model export
+    const char* output_names_[1] = {"actions"};
+    VecXf command;
+    Ort::MemoryInfo memory_info{nullptr};
+    std::array<int64_t, 2> input_observationShape_ = {1, 57};
+    
+    float time_step = 0.;
+    int stop_count = 1000;
+    int waypoint_idx_ = 0;
+    std::vector<Eigen::Vector2f> waypoints_xy_;
+    Vec4f last_waypoint_cmd_ = Vec4f::Zero();
+    static constexpr float waypoint_reach_threshold_ = 0.25f;
+    static constexpr float raw_action_limit_ = 10.0f;
+    static constexpr float wheel_vel_limit_ = 50.0f;
+
+public:
+    M20PolicyRunner(const std::string &policy_name, const std::string &policy_path) :
+            PolicyRunnerBase(policy_name), policy_path_(policy_path),env_(ORT_LOGGING_LEVEL_WARNING, "M20PolicyRunner"),
+            session_options_{},
+            session_{nullptr},
+            memory_info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
+
+        dof_default_eigen_policy.setZero(action_dim);
+        dof_default_eigen_robot.setZero(action_dim);
+        dof_default_eigen_policy << 0.0, -0.3,  0.6, 
+                                    0.0, -0.3,  0.6,  
+                                    0.0,  0.3, -0.6,  
+                                    0.0,  0.3, -0.6, 
+                                    0.0, 0.0, 0.0, 0.0;
+        dof_default_eigen_robot << 0.0, -0.3,  0.6, 0.0,
+                                   0.0, -0.3,  0.6, 0.0,
+                                   0.0,  0.3, -0.6, 0.0,
+                                   0.0,  0.3, -0.6, 0.0;
+        SetDecimation(4);
+        session_options_.SetIntraOpNumThreads(4);
+        session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+        
+        if (access(policy_path_.c_str(), F_OK) != 0) {
+            std::cerr << "Model file not found: " << policy_path_ << std::endl;
+            throw std::runtime_error("Model file missing");
+            }
+
+        // 加载模型
+        session_ = Ort::Session(env_, policy_path_.c_str(), session_options_);
+        // Read model input obs dim dynamically (57/58) with robust fallback.
+        // Some ORT builds may throw on GetShape(); prefer fixed-size GetDimensions.
+        observation_dim_ = 57;
+        try {
+            auto in_info = session_.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
+            const size_t dim_count = in_info.GetDimensionsCount();
+            if (dim_count == 2) {
+                int64_t dims[2] = {1, 57};
+                in_info.GetDimensions(dims, 2);
+                if (dims[1] == 57 || dims[1] == 58) {
+                    observation_dim_ = static_cast<int>(dims[1]);
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[M20PolicyRunner] Failed to query ONNX input shape, fallback to 57. reason: "
+                      << e.what() << std::endl;
+            observation_dim_ = 57;
+        }
+        input_observationShape_ = {1, static_cast<int64_t>(observation_dim_)};
+        std::cout << "[M20PolicyRunner] ONNX obs dim = " << observation_dim_ << std::endl;
+        kp_ = Vec4f(80, 80, 80, 0.).replicate(4, 1);
+        kd_ = Vec4f(2, 2, 2, 0.6).replicate(4, 1);
+        
+        robot2policy_idx = generate_permutation(robot_order, policy_order);
+        policy2robot_idx = generate_permutation(policy_order, robot_order);
+        // for (int i = 0; i < action_dim; ++i){
+        //     std::cout << "robot2policy_idx[" << i << "]: " << robot2policy_idx[i] << std::endl;
+        //     std::cout << "policy2robot_idx[" << i << "]: " << policy2robot_idx[i] << std::endl;
+        // }
+
+        robot_action.kp = kp_;
+        robot_action.kd = kd_;
+        robot_action.tau_ff = VecXf::Zero(motor_num);
+        robot_action.goal_joint_pos = VecXf::Zero(motor_num);
+        robot_action.goal_joint_vel = VecXf::Zero(motor_num);
+
+
+        current_observation_.setZero(observation_dim_);
+        last_action_eigen.setZero(action_dim);
+        last_waypoint_cmd_.setZero();
+        tmp_action_eigen.setZero(action_dim);
+        current_action_eigen.setZero(action_dim);
+
+        memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+
+        waypoints_xy_ = {
+            Eigen::Vector2f(0.0f, -0.5f),
+            Eigen::Vector2f(1.0f, 0.5f),
+            Eigen::Vector2f(2.0f, -0.5f),
+            Eigen::Vector2f(3.0f, 0.5f),
+            Eigen::Vector2f(2.0f, -0.5f),
+            Eigen::Vector2f(1.0f, 0.5f),
+            Eigen::Vector2f(0.0f, -0.5f),
+        };
+    }
+
+    ~M20PolicyRunner() override = default;
+
+    std::vector<int> generate_permutation(
+        const std::vector<std::string>& from, 
+        const std::vector<std::string>& to, 
+        int default_index = 0) 
+    {
+        std::unordered_map<std::string, int> idx_map;
+        for (int i = 0; i < from.size(); ++i) {
+            idx_map[from[i]] = i;
+        }
+
+        std::vector<int> perm;
+        for (const auto& name : to) {
+            auto it = idx_map.find(name);
+            if (it != idx_map.end()) {
+                perm.push_back(it->second);
+            } else {
+                perm.push_back(default_index);  // 如果找不到，就填默认值
+            }
+        }
+
+        return perm;
+    }
+
+    void DisplayPolicyInfo(){}
+
+    void OnEnter() override {
+        OnEnter(UserCommand());
+    }
+
+    void OnEnter(const UserCommand& uc) {
+        run_cnt_ = 0;
+        if (uc.reserved_scale > 0.5f && !waypoints_xy_.empty()) {
+            waypoint_idx_ = (waypoint_idx_ + 1) % static_cast<int>(waypoints_xy_.size());
+            std::cout << "[M20PolicyRunner] Resume waypoint tracking from next point #"
+                      << waypoint_idx_ << std::endl;
+        } else {
+            waypoint_idx_ = 0;
+            std::cout << "[M20PolicyRunner] Start waypoint tracking from point #0" << std::endl;
+        }
+        cmd_vel_input_.setZero();
+        last_action_eigen.setZero(action_dim);
+        tmp_action_eigen.setZero(action_dim);
+        motor_p_eigen.setZero(12);
+        motor_v_eigen.setZero(motor_num);
+    }
+
+    static float WrapToPi(float angle) {
+        while (angle > static_cast<float>(M_PI)) angle -= 2.0f * static_cast<float>(M_PI);
+        while (angle < -static_cast<float>(M_PI)) angle += 2.0f * static_cast<float>(M_PI);
+        return angle;
+    }
+
+    Vec4f BuildWaypointCommand(const RobotBasicState &ro) {
+        if (waypoints_xy_.empty()) {
+            return Vec4f::Zero();
+        }
+
+        Eigen::Vector2f base_xy(ro.base_pos_w(0), ro.base_pos_w(1));
+        Eigen::Vector2f target_xy = waypoints_xy_[waypoint_idx_];
+        Eigen::Vector2f delta_w = target_xy - base_xy;
+        float dist = delta_w.norm();
+        if (dist < waypoint_reach_threshold_) {
+            waypoint_idx_ = (waypoint_idx_ + 1) % static_cast<int>(waypoints_xy_.size());
+            target_xy = waypoints_xy_[waypoint_idx_];
+            delta_w = target_xy - base_xy;
+        }
+
+        const float yaw = ro.base_rpy(2);
+        const float cy = std::cos(yaw);
+        const float sy = std::sin(yaw);
+        const float dx_b = cy * delta_w(0) + sy * delta_w(1);
+        const float dy_b = -sy * delta_w(0) + cy * delta_w(1);
+        const float dz_b = 0.0f;
+        const float desired_heading_w = std::atan2(delta_w(1), delta_w(0));
+        const float dheading = WrapToPi(desired_heading_w - yaw);
+
+        return Vec4f(dx_b, dy_b, dz_b, dheading);
+    }
+
+    VecXf Onnx_infer(VecXf current_observation){
+        
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info,
+            current_observation.data(),
+            current_observation.size(),
+            input_observationShape_.data(),
+            input_observationShape_.size()
+        );
+
+        std::vector<Ort::Value> inputs;
+        inputs.emplace_back(std::move(input_tensor));  // 避免拷贝构造
+        
+        auto outputs = session_.Run(
+            Ort::RunOptions{nullptr},
+            input_names_,
+            inputs.data(),
+            1,
+            output_names_,
+            1
+        );
+
+        float* action_data = outputs[0].GetTensorMutableData<float>();
+        Eigen::Map<Eigen::VectorXf> action_map(action_data, action_dim);
+        return VecXf(action_map);  // 返回一个Eigen向量的副本
+    }
+
+    VecXf BuildObservation(const Vec3f& base_omgea,
+                           const Vec3f& projected_gravity,
+                           const UserCommand& uc,
+                           const RobotBasicState& ro,
+                           const VecXf& joint_pos_rl,
+                           const VecXf& joint_vel_rl,
+                           const VecXf& last_action_eigen,
+                           int obs_dim) {
+        VecXf obs(obs_dim);
+        if (obs_dim == 58) {
+            Vec4f waypoint_cmd = BuildWaypointCommand(ro);
+            last_waypoint_cmd_ = waypoint_cmd;
+            obs << base_omgea,
+                   projected_gravity,
+                   waypoint_cmd,
+                   joint_pos_rl,
+                   joint_vel_rl,
+                   last_action_eigen;
+        } else {
+            Vec3f command = Vec3f(uc.forward_vel_scale, uc.side_vel_scale, uc.turnning_vel_scale);
+            obs << base_omgea,
+                   projected_gravity,
+                   command,
+                   joint_pos_rl,
+                   joint_vel_rl,
+                   last_action_eigen;
+        }
+        return obs;
+    }
+
+    RobotAction getRobotAction(const RobotBasicState &ro, const UserCommand &uc) {
+
+        Vec3f base_omgea = ro.base_omega * omega_scale_;
+        Vec3f projected_gravity = ro.base_rot_mat.inverse() * gravity_direction;
+        for (int i = 0; i < action_dim; ++i){
+            joint_pos_rl(i) = ro.joint_pos(robot2policy_idx[i]);
+            joint_vel_rl(i) = ro.joint_vel(robot2policy_idx[i]) * dof_vel_scale_;
+        }
+        joint_pos_rl.segment(12, 4).setZero();
+
+        joint_pos_rl -= dof_default_eigen_policy;
+        current_observation_ = BuildObservation(
+            base_omgea, projected_gravity, uc, ro, joint_pos_rl, joint_vel_rl, last_action_eigen, observation_dim_);
+        try {
+            current_action_eigen = Onnx_infer(current_observation_);
+        } catch (const Ort::Exception& e) {
+            std::string err = e.what();
+            // Fallback: if model actually expects 58-dim obs, switch and retry once.
+            if (observation_dim_ == 57 && err.find("Expected: 58") != std::string::npos) {
+                observation_dim_ = 58;
+                input_observationShape_ = {1, 58};
+                current_observation_ = BuildObservation(
+                    base_omgea, projected_gravity, uc, ro, joint_pos_rl, joint_vel_rl, last_action_eigen, 58);
+                std::cout << "[M20PolicyRunner] Auto-switch obs dim 57 -> 58 after ORT shape error." << std::endl;
+                current_action_eigen = Onnx_infer(current_observation_);
+            } else {
+                throw;
+            }
+        }
+        VecXf raw_action_eigen = current_action_eigen;
+        current_action_eigen = current_action_eigen
+            .cwiseMax(-raw_action_limit_)
+            .cwiseMin(raw_action_limit_);
+        last_action_eigen = current_action_eigen;
+
+        
+        for (int i = 0; i < action_dim; ++i){
+            tmp_action_eigen(i) = current_action_eigen(policy2robot_idx[i]);
+            tmp_action_eigen(i) *= action_scale_robot[i];
+        }
+        tmp_action_eigen += dof_default_eigen_robot;
+        
+        for (int i = 0; i < 4; ++i){
+            robot_action.goal_joint_pos.segment(i*4, 3) = tmp_action_eigen.segment(i*4, 3);
+            robot_action.goal_joint_vel(i*4+3) = LimitNumber(tmp_action_eigen(i*4+3), -wheel_vel_limit_, wheel_vel_limit_);
+        }
+
+        if (run_cnt_ < 20 || run_cnt_ % 50 == 0) {
+            std::cout << "[M20PolicyRunner] debug"
+                      << " cnt=" << run_cnt_
+                      << " obs_dim=" << observation_dim_
+                      << " wp=" << waypoint_idx_
+                      << " base_xy=(" << ro.base_pos_w(0) << "," << ro.base_pos_w(1) << ")"
+                      << " cmd=(" << last_waypoint_cmd_.transpose() << ")"
+                      << " joint_rel_minmax=(" << joint_pos_rl.minCoeff() << "," << joint_pos_rl.maxCoeff() << ")"
+                      << " raw_action_minmax=(" << raw_action_eigen.minCoeff() << "," << raw_action_eigen.maxCoeff() << ")"
+                      << " clipped_action_minmax=(" << current_action_eigen.minCoeff() << "," << current_action_eigen.maxCoeff() << ")"
+                      << std::endl;
+        }
+
+        
+        ++run_cnt_;
+        ++time_step;
+        return robot_action;
+    }
+
+    void setDefaultJointPos(const VecXf& pos){
+        dof_pos_default_.setZero(motor_num); 
+        for(int i=0;i<motor_num;++i) {
+            dof_pos_default_(i) = pos(i);
+        }
+    }
+
+    double getCurrentTime() {
+        clock_gettime(1, &system_time);
+        return system_time.tv_sec + system_time.tv_nsec / 1e9;
+    }
+};
