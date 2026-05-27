@@ -9,7 +9,6 @@ protected:
         memset(data_updated_, 0, dof_num_ * sizeof(bool));
         this->SetJointCommand(MatXf::Zero(dof_num_, 5));
 
-        VecXf last_joint_pos = this->GetJointPosition();
         VecXf current_joint_pos = this->GetJointPosition();
         int cnt = 0;
         while (rclcpp::ok() && !IsDataUpdatedFinished()) {
@@ -18,17 +17,6 @@ protected:
 
             rclcpp::spin_some(this->get_node());
             current_joint_pos = this->GetJointPosition();
-            for (int i = 0; i < dof_num_; ++i) {
-                if (data_updated_[i]) {
-                    continue;
-                }
-                // Accept first valid sample; do not require value change.
-                if (!std::isnan(current_joint_pos(i))) {
-                    data_updated_[i] = true;
-                    std::cout << "joint " << i << " data updated at " << cnt << " cnt!" << std::endl;
-                }
-            }
-            last_joint_pos = current_joint_pos;
 
             if (cnt == 10000) {
                 for (int i = 0; i < dof_num_; ++i) {

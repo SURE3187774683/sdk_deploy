@@ -175,9 +175,7 @@ private:
         bool res = true;
         robot_error_state_.driver_error = 0;
         for (int i = 0; i < status_word.size(); ++i) {
-            // For simulation, status_word may be 0 (dummy) or 1 (normal).
-            // Treat both as non-fault to avoid false-positive safe stop.
-            if (status_word[i] != 0 && status_word[i] != 1) {
+            if (status_word[i] != 1) {
                 error_driver_map_[uint8_t(i)] = status_word[i];
                 robot_error_state_.driver_error = 1;
                 res = false;

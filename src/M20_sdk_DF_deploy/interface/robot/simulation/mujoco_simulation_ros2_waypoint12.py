@@ -42,7 +42,7 @@ FALLBACK_KP = 80.0
 FALLBACK_KD = 2.0
 MAX_JOINT_TORQUE_ABS = 120.0
 
-# 12个点（世界坐标系 x,y）
+# Waypoints are relative to the robot base position when the simulation starts.
 WAYPOINTS_XY = np.array([
     [0.0, -0.5],
     [1.0, 0.5],
@@ -91,10 +91,14 @@ class MuJoCoSimulationWaypointNode(Node):
         self.last_cmd_time = -1.0
 
         self.wp_idx = 0
-        self.waypoints_xy = WAYPOINTS_XY.copy()
+        self.waypoint_origin_xy = self.data.qpos[:2].copy().astype(np.float32)
+        self.waypoints_xy = self.waypoint_origin_xy + WAYPOINTS_XY.copy()
         self.wp_total = self.waypoints_xy.shape[0]
 
         self.get_logger().info(f"[INFO] MuJoCo model loaded, dof={self.dof_num}, waypoints={self.wp_total}")
+        self.get_logger().info(
+            f"[WP] origin=({self.waypoint_origin_xy[0]:.2f}, {self.waypoint_origin_xy[1]:.2f})"
+        )
 
         self.imu_pub = self.create_publisher(ImuData, '/IMU_DATA', 200)
         self.joints_pub = self.create_publisher(JointsData, '/JOINTS_DATA', 200)

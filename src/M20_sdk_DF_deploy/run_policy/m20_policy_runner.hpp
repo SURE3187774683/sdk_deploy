@@ -85,8 +85,10 @@ private:
     int stop_count = 1000;
     int waypoint_idx_ = 0;
     std::vector<Eigen::Vector2f> waypoints_xy_;
+    Eigen::Vector2f waypoint_origin_xy_ = Eigen::Vector2f::Zero();
+    bool waypoint_origin_initialized_ = false;
     Vec4f last_waypoint_cmd_ = Vec4f::Zero();
-    static constexpr float waypoint_reach_threshold_ = 0.25f;
+    static constexpr float waypoint_reach_threshold_ = 0.1f;
     static constexpr float raw_action_limit_ = 10.0f;
     static constexpr float wheel_vel_limit_ = 50.0f;
 
@@ -194,6 +196,8 @@ public:
             waypoint_idx_ = 0;
             std::cout << "[M20PolicyRunner] Start waypoint tracking from point #0" << std::endl;
         }
+        waypoint_origin_initialized_ = false;
+        waypoint_origin_xy_.setZero();
         cmd_vel_input_.setZero();
         last_action_eigen.setZero(action_dim);
         tmp_action_eigen.setZero(action_dim);
@@ -213,12 +217,19 @@ public:
         }
 
         Eigen::Vector2f base_xy(ro.base_pos_w(0), ro.base_pos_w(1));
-        Eigen::Vector2f target_xy = waypoints_xy_[waypoint_idx_];
+        if (!waypoint_origin_initialized_) {
+            waypoint_origin_xy_ = base_xy;
+            waypoint_origin_initialized_ = true;
+            std::cout << "[M20PolicyRunner] Waypoint origin set to ("
+                      << waypoint_origin_xy_(0) << ", " << waypoint_origin_xy_(1) << ")" << std::endl;
+        }
+
+        Eigen::Vector2f target_xy = waypoint_origin_xy_ + waypoints_xy_[waypoint_idx_];
         Eigen::Vector2f delta_w = target_xy - base_xy;
         float dist = delta_w.norm();
         if (dist < waypoint_reach_threshold_) {
             waypoint_idx_ = (waypoint_idx_ + 1) % static_cast<int>(waypoints_xy_.size());
-            target_xy = waypoints_xy_[waypoint_idx_];
+            target_xy = waypoint_origin_xy_ + waypoints_xy_[waypoint_idx_];
             delta_w = target_xy - base_xy;
         }
 

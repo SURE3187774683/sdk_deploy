@@ -36,6 +36,7 @@ protected:
     double ri_ts_ = 0.0, imu_ts_ = 0.0;
     Vec3f omega_body_, rpy_, acc_;
     Vec3f base_pos_w_ = Vec3f::Zero();
+    bool slam_odom_received_ = false;
     VecXf joint_pos_, joint_vel_, joint_tau_;
     VecXf motor_temperture_, driver_temperture_;
     float *pos_offset_;
@@ -66,6 +67,26 @@ protected:
             res = res & data_updated_[i];
         }
         return res;
+    }
+
+    Vec3f QuaternionToRpy(const double x, const double y, const double z, const double w) {
+        const double sinr_cosp = 2.0 * (w * x + y * z);
+        const double cosr_cosp = 1.0 - 2.0 * (x * x + y * y);
+        const double roll = std::atan2(sinr_cosp, cosr_cosp);
+
+        const double sinp = 2.0 * (w * y - z * x);
+        double pitch = 0.0;
+        if (std::abs(sinp) >= 1.0) {
+            pitch = std::copysign(M_PI / 2.0, sinp);
+        } else {
+            pitch = std::asin(sinp);
+        }
+
+        const double siny_cosp = 2.0 * (w * z + x * y);
+        const double cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
+        const double yaw = std::atan2(siny_cosp, cosy_cosp);
+
+        return Vec3f(static_cast<float>(roll), static_cast<float>(pitch), static_cast<float>(yaw));
     }
 
     void ResetPositionOffset() {
@@ -281,7 +302,9 @@ public:
     }
 
     void HandlerIMU(const drdds::msg::ImuData::SharedPtr msg) {
-        rpy_ = Vec3f(Deg2Rad(msg->data.roll), Deg2Rad(msg->data.pitch), Deg2Rad(msg->data.yaw));
+        if (!slam_odom_received_) {
+            rpy_ = Vec3f(Deg2Rad(msg->data.roll), Deg2Rad(msg->data.pitch), Deg2Rad(msg->data.yaw));
+        }
         acc_ << msg->data.acc_x, msg->data.acc_y, msg->data.acc_z;
         omega_body_ << msg->data.omega_x, msg->data.omega_y, msg->data.omega_z;
         imu_ts_ = rclcpp::Time(msg->header.stamp).seconds();
@@ -297,6 +320,9 @@ public:
         base_pos_w_ << msg->pose.pose.position.x,
                        msg->pose.pose.position.y,
                        msg->pose.pose.position.z;
+        const auto& q = msg->pose.pose.orientation;
+        rpy_ = QuaternionToRpy(q.x, q.y, q.z, q.w);
+        slam_odom_received_ = true;
     }
 
     void HandlerBasePose(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
