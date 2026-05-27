@@ -29,7 +29,7 @@ private:
     timespec system_time;
 
     const int motor_num = 16;
-    int observation_dim_ = 57;
+    static constexpr int observation_dim_ = 58;
     const int action_dim = 16;
     float agent_timestep = 0.02;
     float current_time;
@@ -79,7 +79,7 @@ private:
     const char* output_names_[1] = {"actions"};
     VecXf command;
     Ort::MemoryInfo memory_info{nullptr};
-    std::array<int64_t, 2> input_observationShape_ = {1, 57};
+    const std::array<int64_t, 2> input_observationShape_ = {1, observation_dim_};
     
     float time_step = 0.;
     int stop_count = 1000;
@@ -117,27 +117,7 @@ public:
             throw std::runtime_error("Model file missing");
             }
 
-        // 加载模型
         session_ = Ort::Session(env_, policy_path_.c_str(), session_options_);
-        // Read model input obs dim dynamically (57/58) with robust fallback.
-        // Some ORT builds may throw on GetShape(); prefer fixed-size GetDimensions.
-        observation_dim_ = 57;
-        try {
-            auto in_info = session_.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-            const size_t dim_count = in_info.GetDimensionsCount();
-            if (dim_count == 2) {
-                int64_t dims[2] = {1, 57};
-                in_info.GetDimensions(dims, 2);
-                if (dims[1] == 57 || dims[1] == 58) {
-                    observation_dim_ = static_cast<int>(dims[1]);
-                }
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[M20PolicyRunner] Failed to query ONNX input shape, fallback to 57. reason: "
-                      << e.what() << std::endl;
-            observation_dim_ = 57;
-        }
-        input_observationShape_ = {1, static_cast<int64_t>(observation_dim_)};
         std::cout << "[M20PolicyRunner] ONNX obs dim = " << observation_dim_ << std::endl;
         kp_ = Vec4f(80, 80, 80, 0.).replicate(4, 1);
         kd_ = Vec4f(2, 2, 2, 0.6).replicate(4, 1);
@@ -167,8 +147,6 @@ public:
         waypoints_xy_ = {
             Eigen::Vector2f(0.0f, -0.5f),
             Eigen::Vector2f(1.0f, 0.5f),
-            Eigen::Vector2f(2.0f, -0.5f),
-            Eigen::Vector2f(3.0f, 0.5f),
             Eigen::Vector2f(2.0f, -0.5f),
             Eigen::Vector2f(1.0f, 0.5f),
             Eigen::Vector2f(0.0f, -0.5f),
@@ -285,35 +263,23 @@ public:
 
     VecXf BuildObservation(const Vec3f& base_omgea,
                            const Vec3f& projected_gravity,
-                           const UserCommand& uc,
                            const RobotBasicState& ro,
                            const VecXf& joint_pos_rl,
                            const VecXf& joint_vel_rl,
-                           const VecXf& last_action_eigen,
-                           int obs_dim) {
-        VecXf obs(obs_dim);
-        if (obs_dim == 58) {
-            Vec4f waypoint_cmd = BuildWaypointCommand(ro);
-            last_waypoint_cmd_ = waypoint_cmd;
-            obs << base_omgea,
-                   projected_gravity,
-                   waypoint_cmd,
-                   joint_pos_rl,
-                   joint_vel_rl,
-                   last_action_eigen;
-        } else {
-            Vec3f command = Vec3f(uc.forward_vel_scale, uc.side_vel_scale, uc.turnning_vel_scale);
-            obs << base_omgea,
-                   projected_gravity,
-                   command,
-                   joint_pos_rl,
-                   joint_vel_rl,
-                   last_action_eigen;
-        }
+                           const VecXf& last_action_eigen) {
+        VecXf obs(observation_dim_);
+        Vec4f waypoint_cmd = BuildWaypointCommand(ro);
+        last_waypoint_cmd_ = waypoint_cmd;
+        obs << base_omgea,
+               projected_gravity,
+               waypoint_cmd,
+               joint_pos_rl,
+               joint_vel_rl,
+               last_action_eigen;
         return obs;
     }
 
-    RobotAction getRobotAction(const RobotBasicState &ro, const UserCommand &uc) {
+    RobotAction getRobotAction(const RobotBasicState &ro, const UserCommand &) {
 
         Vec3f base_omgea = ro.base_omega * omega_scale_;
         Vec3f projected_gravity = ro.base_rot_mat.inverse() * gravity_direction;
@@ -325,23 +291,8 @@ public:
 
         joint_pos_rl -= dof_default_eigen_policy;
         current_observation_ = BuildObservation(
-            base_omgea, projected_gravity, uc, ro, joint_pos_rl, joint_vel_rl, last_action_eigen, observation_dim_);
-        try {
-            current_action_eigen = Onnx_infer(current_observation_);
-        } catch (const Ort::Exception& e) {
-            std::string err = e.what();
-            // Fallback: if model actually expects 58-dim obs, switch and retry once.
-            if (observation_dim_ == 57 && err.find("Expected: 58") != std::string::npos) {
-                observation_dim_ = 58;
-                input_observationShape_ = {1, 58};
-                current_observation_ = BuildObservation(
-                    base_omgea, projected_gravity, uc, ro, joint_pos_rl, joint_vel_rl, last_action_eigen, 58);
-                std::cout << "[M20PolicyRunner] Auto-switch obs dim 57 -> 58 after ORT shape error." << std::endl;
-                current_action_eigen = Onnx_infer(current_observation_);
-            } else {
-                throw;
-            }
-        }
+            base_omgea, projected_gravity, ro, joint_pos_rl, joint_vel_rl, last_action_eigen);
+        current_action_eigen = Onnx_infer(current_observation_);
         VecXf raw_action_eigen = current_action_eigen;
         current_action_eigen = current_action_eigen
             .cwiseMax(-raw_action_limit_)
@@ -360,18 +311,18 @@ public:
             robot_action.goal_joint_vel(i*4+3) = LimitNumber(tmp_action_eigen(i*4+3), -wheel_vel_limit_, wheel_vel_limit_);
         }
 
-        if (run_cnt_ < 20 || run_cnt_ % 50 == 0) {
-            std::cout << "[M20PolicyRunner] debug"
-                      << " cnt=" << run_cnt_
-                      << " obs_dim=" << observation_dim_
-                      << " wp=" << waypoint_idx_
-                      << " base_xy=(" << ro.base_pos_w(0) << "," << ro.base_pos_w(1) << ")"
-                      << " cmd=(" << last_waypoint_cmd_.transpose() << ")"
-                      << " joint_rel_minmax=(" << joint_pos_rl.minCoeff() << "," << joint_pos_rl.maxCoeff() << ")"
-                      << " raw_action_minmax=(" << raw_action_eigen.minCoeff() << "," << raw_action_eigen.maxCoeff() << ")"
-                      << " clipped_action_minmax=(" << current_action_eigen.minCoeff() << "," << current_action_eigen.maxCoeff() << ")"
-                      << std::endl;
-        }
+        // if (run_cnt_ < 20 || run_cnt_ % 50 == 0) {
+        //     std::cout << "[M20PolicyRunner] debug"
+        //               << " cnt=" << run_cnt_
+        //               << " obs_dim=" << observation_dim_
+        //               << " wp=" << waypoint_idx_
+        //               << " base_xy=(" << ro.base_pos_w(0) << "," << ro.base_pos_w(1) << ")"
+        //               << " cmd=(" << last_waypoint_cmd_.transpose() << ")"
+        //               << " joint_rel_minmax=(" << joint_pos_rl.minCoeff() << "," << joint_pos_rl.maxCoeff() << ")"
+        //               << " raw_action_minmax=(" << raw_action_eigen.minCoeff() << "," << raw_action_eigen.maxCoeff() << ")"
+        //               << " clipped_action_minmax=(" << current_action_eigen.minCoeff() << "," << current_action_eigen.maxCoeff() << ")"
+        //               << std::endl;
+        // }
 
         
         ++run_cnt_;

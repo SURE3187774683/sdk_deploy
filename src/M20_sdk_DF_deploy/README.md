@@ -144,10 +144,10 @@ ros2 run m20_sdk_DF_deploy rl_deploy
 
 ### ⌨️ Keyboard Control
 - z： default position
-- c： rl control default position
+- s： waypoint tracking
 - x： lie down
-- wasd：forward/leftward/backward/rightward
-- qe：clockwise/counter clockwise
+- p： 暂停回站立；站立状态下再按 P 恢复并切到下一个 waypoint
+- r： 关节阻尼/急停式保护
 
 ### 🎮 Gamepad Control
 *(Note: When using the gamepad control function, please ensure that the Gamepad APP version is V1.5.11 or higher.)*
