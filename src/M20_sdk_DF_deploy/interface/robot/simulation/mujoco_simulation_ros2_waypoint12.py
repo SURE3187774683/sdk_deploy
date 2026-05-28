@@ -42,28 +42,43 @@ FALLBACK_KP = 80.0
 FALLBACK_KD = 2.0
 MAX_JOINT_TORQUE_ABS = 120.0
 
-def _resolve_waypoint_csv_path() -> Path:
-    env_path = os.getenv("M20_WAYPOINT_CSV")
+def _resolve_waypoint_cfg_path() -> Path:
+    env_path = os.getenv("M20_WAYPOINT_CFG")
     if env_path:
         p = Path(env_path).expanduser().resolve()
         if p.is_file():
             return p
-    return (CURRENT_DIR / ".." / ".." / ".." / "config" / "waypoints_xy.csv").resolve()
+    return (CURRENT_DIR / ".." / ".." / ".." / "config" / "waypoint_rect.cfg").resolve()
 
 
-def _load_waypoints_xy() -> np.ndarray:
-    csv_path = _resolve_waypoint_csv_path()
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"Waypoint csv not found: {csv_path}")
-    arr = np.loadtxt(str(csv_path), delimiter=",", comments="#", dtype=np.float32)
-    arr = np.atleast_2d(arr)
-    if arr.shape[1] != 2:
-        raise ValueError(f"Waypoint csv must have 2 columns (x,y), got shape={arr.shape}")
-    return arr
+def _load_waypoint_rect_cfg() -> dict:
+    cfg_path = _resolve_waypoint_cfg_path()
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Waypoint cfg not found: {cfg_path}")
+    cfg = {
+        "length_x": 16.0,
+        "width_y": 8.0,
+        "num_points": 11,
+        "seed": 42,
+    }
+    with cfg_path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k in ("length_x", "width_y"):
+                cfg[k] = float(v)
+            elif k in ("num_points", "seed"):
+                cfg[k] = int(v)
+    if cfg["num_points"] < 2 or cfg["length_x"] <= 0.0 or cfg["width_y"] <= 0.0:
+        raise ValueError(f"Invalid waypoint cfg: {cfg}")
+    return cfg
 
 
-# Waypoints are relative to the robot base position when the simulation starts.
-WAYPOINTS_XY = _load_waypoints_xy()
+WAYPOINT_CFG = _load_waypoint_rect_cfg()
 
 JOINT_DIR = np.array([1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1, -1], dtype=np.float32)
 POS_OFFSET_DEG = np.array([-25, 229, 160, 0, 25, -131, -200, 0, -25, -229, -160, 0, 25, 131, 200, 0], dtype=np.float32)
@@ -106,12 +121,13 @@ class MuJoCoSimulationWaypointNode(Node):
 
         self.wp_idx = 0
         self.waypoint_origin_xy = self.data.qpos[:2].copy().astype(np.float32)
-        self.waypoints_xy = self.waypoint_origin_xy + WAYPOINTS_XY.copy()
+        yaw0 = float(self.quaternion_to_euler(self.data.qpos[3:7].copy())[2])
+        self.waypoints_xy = self._generate_world_waypoints(self.waypoint_origin_xy, yaw0)
         self.wp_total = self.waypoints_xy.shape[0]
 
         self.get_logger().info(f"[INFO] MuJoCo model loaded, dof={self.dof_num}, waypoints={self.wp_total}")
         self.get_logger().info(
-            f"[WP] origin=({self.waypoint_origin_xy[0]:.2f}, {self.waypoint_origin_xy[1]:.2f})"
+            f"[WP] origin=({self.waypoint_origin_xy[0]:.2f}, {self.waypoint_origin_xy[1]:.2f}), yaw0={yaw0:.3f}"
         )
 
         self.imu_pub = self.create_publisher(ImuData, '/IMU_DATA', 200)
@@ -181,6 +197,26 @@ class MuJoCoSimulationWaypointNode(Node):
     @staticmethod
     def wrap_to_pi(angle):
         return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _generate_world_waypoints(self, origin_xy: np.ndarray, yaw0: float) -> np.ndarray:
+        n = int(WAYPOINT_CFG["num_points"])
+        local = np.zeros((n, 2), dtype=np.float32)
+        state = (int(WAYPOINT_CFG["seed"]) & 0xFFFFFFFF) if int(WAYPOINT_CFG["seed"]) >= 0 else (int(time.time()) & 0xFFFFFFFF)
+
+        def next_rand01() -> float:
+            nonlocal state
+            state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+            return float(state) / 4294967295.0
+
+        for i in range(1, n):
+            rx = next_rand01()
+            ry = next_rand01()
+            local[i, 0] = rx * float(WAYPOINT_CFG["length_x"])
+            local[i, 1] = (ry - 0.5) * float(WAYPOINT_CFG["width_y"])
+        c0, s0 = np.cos(yaw0), np.sin(yaw0)
+        rot = np.array([[c0, -s0], [s0, c0]], dtype=np.float32)
+        world = (local @ rot.T) + origin_xy.reshape(1, 2)
+        return world.astype(np.float32)
 
     def _apply_joint_torque(self):
         q = self.data.qpos[7:7 + self.dof_num].reshape(-1, 1)

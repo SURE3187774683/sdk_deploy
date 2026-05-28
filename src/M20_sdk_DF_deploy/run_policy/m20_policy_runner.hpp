@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <cstdlib>
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_c_api.h>
 
@@ -89,65 +90,92 @@ private:
     int waypoint_idx_ = 0;
     std::vector<Eigen::Vector2f> waypoints_xy_;
     Eigen::Vector2f waypoint_origin_xy_ = Eigen::Vector2f::Zero();
+    float waypoint_origin_yaw_ = 0.0f;
     bool waypoint_origin_initialized_ = false;
     Vec4f last_waypoint_cmd_ = Vec4f::Zero();
     static constexpr float waypoint_reach_threshold_ = 0.1f;
     static constexpr float raw_action_limit_ = 10.0f;
     static constexpr float wheel_vel_limit_ = 50.0f;
 
-    static std::filesystem::path ResolveWaypointCsvPath() {
-        if (const char* env_path = std::getenv("M20_WAYPOINT_CSV")) {
+    struct WaypointRectConfig {
+        float length_x = 16.0f;
+        float width_y = 8.0f;
+        int num_points = 11;
+        int seed = 42;
+    };
+    WaypointRectConfig waypoint_cfg_;
+
+    static std::filesystem::path ResolveWaypointCfgPath() {
+        if (const char* env_path = std::getenv("M20_WAYPOINT_CFG")) {
             if (std::filesystem::exists(env_path)) {
                 return std::filesystem::path(env_path);
             }
         }
         const std::filesystem::path this_file(__FILE__);
         const auto pkg_root = this_file.parent_path().parent_path();
-        const auto csv_path = pkg_root / "config" / "waypoints_xy.csv";
-        return csv_path;
+        return pkg_root / "config" / "waypoint_rect.cfg";
     }
 
-    bool LoadWaypointsFromCsv() {
-        const auto csv_path = ResolveWaypointCsvPath();
-        std::ifstream ifs(csv_path);
+    bool LoadWaypointRectConfig() {
+        const auto cfg_path = ResolveWaypointCfgPath();
+        std::ifstream ifs(cfg_path);
         if (!ifs.is_open()) {
-            std::cerr << "[M20PolicyRunner] Failed to open waypoint csv: "
-                      << csv_path << std::endl;
+            std::cerr << "[M20PolicyRunner] Failed to open waypoint cfg: "
+                      << cfg_path << std::endl;
             return false;
         }
 
-        std::vector<Eigen::Vector2f> loaded;
         std::string line;
-        int line_no = 0;
         while (std::getline(ifs, line)) {
-            ++line_no;
-            if (line.empty() || line[0] == '#') {
+            if (line.empty() || line[0] == '#' || line.find('=') == std::string::npos) {
                 continue;
             }
-            std::stringstream ss(line);
-            std::string x_str, y_str;
-            if (!std::getline(ss, x_str, ',') || !std::getline(ss, y_str)) {
-                std::cerr << "[M20PolicyRunner] Invalid csv line " << line_no
-                          << ": " << line << std::endl;
-                continue;
-            }
+            const auto pos = line.find('=');
+            std::string key = line.substr(0, pos);
+            std::string val = line.substr(pos + 1);
             try {
-                loaded.emplace_back(std::stof(x_str), std::stof(y_str));
+                if (key == "length_x") waypoint_cfg_.length_x = std::stof(val);
+                else if (key == "width_y") waypoint_cfg_.width_y = std::stof(val);
+                else if (key == "num_points") waypoint_cfg_.num_points = std::stoi(val);
+                else if (key == "seed") waypoint_cfg_.seed = std::stoi(val);
             } catch (const std::exception&) {
-                std::cerr << "[M20PolicyRunner] Parse error at line " << line_no
-                          << ": " << line << std::endl;
+                std::cerr << "[M20PolicyRunner] Invalid cfg item: " << line << std::endl;
             }
         }
 
-        if (loaded.empty()) {
-            std::cerr << "[M20PolicyRunner] No valid waypoints in csv: "
-                      << csv_path << std::endl;
+        if (waypoint_cfg_.num_points < 2 || waypoint_cfg_.length_x <= 0.0f || waypoint_cfg_.width_y <= 0.0f) {
+            std::cerr << "[M20PolicyRunner] Invalid waypoint cfg values in: "
+                      << cfg_path << std::endl;
             return false;
         }
-        waypoints_xy_ = std::move(loaded);
-        std::cout << "[M20PolicyRunner] Loaded " << waypoints_xy_.size()
-                  << " waypoints from " << csv_path << std::endl;
+        std::cout << "[M20PolicyRunner] Waypoint cfg loaded from " << cfg_path
+                  << " (length_x=" << waypoint_cfg_.length_x
+                  << ", width_y=" << waypoint_cfg_.width_y
+                  << ", num_points=" << waypoint_cfg_.num_points
+                  << ", seed=" << waypoint_cfg_.seed << ")" << std::endl;
         return true;
+    }
+
+    void GenerateWaypoints() {
+        waypoints_xy_.clear();
+        waypoints_xy_.reserve(static_cast<size_t>(waypoint_cfg_.num_points));
+        waypoints_xy_.emplace_back(0.0f, 0.0f);
+
+        uint32_t state = (waypoint_cfg_.seed >= 0)
+            ? static_cast<uint32_t>(waypoint_cfg_.seed)
+            : static_cast<uint32_t>(std::time(nullptr));
+        auto next_rand01 = [&state]() -> float {
+            state = state * 1664525u + 1013904223u;
+            return static_cast<float>(state) / 4294967295.0f;
+        };
+
+        for (int i = 1; i < waypoint_cfg_.num_points; ++i) {
+            const float rx = next_rand01();
+            const float ry = next_rand01();
+            const float x = rx * waypoint_cfg_.length_x;
+            const float y = (ry - 0.5f) * waypoint_cfg_.width_y;
+            waypoints_xy_.emplace_back(x, y);
+        }
     }
 
 public:
@@ -204,9 +232,10 @@ public:
 
         memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-        if (!LoadWaypointsFromCsv()) {
-            throw std::runtime_error("Failed to load waypoints from csv");
+        if (!LoadWaypointRectConfig()) {
+            throw std::runtime_error("Failed to load waypoint rectangle config");
         }
+        GenerateWaypoints();
     }
 
     ~M20PolicyRunner() override = default;
@@ -252,6 +281,8 @@ public:
         }
         waypoint_origin_initialized_ = false;
         waypoint_origin_xy_.setZero();
+        waypoint_origin_yaw_ = 0.0f;
+        GenerateWaypoints();
         cmd_vel_input_.setZero();
         last_action_eigen.setZero(action_dim);
         tmp_action_eigen.setZero(action_dim);
@@ -273,17 +304,27 @@ public:
         Eigen::Vector2f base_xy(ro.base_pos_w(0), ro.base_pos_w(1));
         if (!waypoint_origin_initialized_) {
             waypoint_origin_xy_ = base_xy;
+            waypoint_origin_yaw_ = ro.base_rpy(2);
             waypoint_origin_initialized_ = true;
             std::cout << "[M20PolicyRunner] Waypoint origin set to ("
-                      << waypoint_origin_xy_(0) << ", " << waypoint_origin_xy_(1) << ")" << std::endl;
+                      << waypoint_origin_xy_(0) << ", " << waypoint_origin_xy_(1)
+                      << "), yaw0=" << waypoint_origin_yaw_ << std::endl;
         }
 
-        Eigen::Vector2f target_xy = waypoint_origin_xy_ + waypoints_xy_[waypoint_idx_];
+        const float c0 = std::cos(waypoint_origin_yaw_);
+        const float s0 = std::sin(waypoint_origin_yaw_);
+        const Eigen::Vector2f &local_wp = waypoints_xy_[waypoint_idx_];
+        Eigen::Vector2f target_xy = waypoint_origin_xy_ + Eigen::Vector2f(
+            c0 * local_wp(0) - s0 * local_wp(1),
+            s0 * local_wp(0) + c0 * local_wp(1));
         Eigen::Vector2f delta_w = target_xy - base_xy;
         float dist = delta_w.norm();
         if (dist < waypoint_reach_threshold_) {
             waypoint_idx_ = (waypoint_idx_ + 1) % static_cast<int>(waypoints_xy_.size());
-            target_xy = waypoint_origin_xy_ + waypoints_xy_[waypoint_idx_];
+            const Eigen::Vector2f &local_wp_next = waypoints_xy_[waypoint_idx_];
+            target_xy = waypoint_origin_xy_ + Eigen::Vector2f(
+                c0 * local_wp_next(0) - s0 * local_wp_next(1),
+                s0 * local_wp_next(0) + c0 * local_wp_next(1));
             delta_w = target_xy - base_xy;
         }
 
