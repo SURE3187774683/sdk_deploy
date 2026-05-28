@@ -42,14 +42,28 @@ FALLBACK_KP = 80.0
 FALLBACK_KD = 2.0
 MAX_JOINT_TORQUE_ABS = 120.0
 
+def _resolve_waypoint_csv_path() -> Path:
+    env_path = os.getenv("M20_WAYPOINT_CSV")
+    if env_path:
+        p = Path(env_path).expanduser().resolve()
+        if p.is_file():
+            return p
+    return (CURRENT_DIR / ".." / ".." / ".." / "config" / "waypoints_xy.csv").resolve()
+
+
+def _load_waypoints_xy() -> np.ndarray:
+    csv_path = _resolve_waypoint_csv_path()
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Waypoint csv not found: {csv_path}")
+    arr = np.loadtxt(str(csv_path), delimiter=",", comments="#", dtype=np.float32)
+    arr = np.atleast_2d(arr)
+    if arr.shape[1] != 2:
+        raise ValueError(f"Waypoint csv must have 2 columns (x,y), got shape={arr.shape}")
+    return arr
+
+
 # Waypoints are relative to the robot base position when the simulation starts.
-WAYPOINTS_XY = np.array([
-    [0.0, -0.5],
-    [1.0, 0.5],
-    [2.0, -0.5],
-    [1.0, 0.5],
-    [0.0, -0.5],
-], dtype=np.float32)
+WAYPOINTS_XY = _load_waypoints_xy()
 
 JOINT_DIR = np.array([1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1, -1], dtype=np.float32)
 POS_OFFSET_DEG = np.array([-25, 229, 160, 0, 25, -131, -200, 0, -25, -229, -160, 0, 25, 131, 200, 0], dtype=np.float32)

@@ -17,6 +17,9 @@
 #include <cmath>
 #include <utility>
 #include <string>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_c_api.h>
 
@@ -92,6 +95,61 @@ private:
     static constexpr float raw_action_limit_ = 10.0f;
     static constexpr float wheel_vel_limit_ = 50.0f;
 
+    static std::filesystem::path ResolveWaypointCsvPath() {
+        if (const char* env_path = std::getenv("M20_WAYPOINT_CSV")) {
+            if (std::filesystem::exists(env_path)) {
+                return std::filesystem::path(env_path);
+            }
+        }
+        const std::filesystem::path this_file(__FILE__);
+        const auto pkg_root = this_file.parent_path().parent_path();
+        const auto csv_path = pkg_root / "config" / "waypoints_xy.csv";
+        return csv_path;
+    }
+
+    bool LoadWaypointsFromCsv() {
+        const auto csv_path = ResolveWaypointCsvPath();
+        std::ifstream ifs(csv_path);
+        if (!ifs.is_open()) {
+            std::cerr << "[M20PolicyRunner] Failed to open waypoint csv: "
+                      << csv_path << std::endl;
+            return false;
+        }
+
+        std::vector<Eigen::Vector2f> loaded;
+        std::string line;
+        int line_no = 0;
+        while (std::getline(ifs, line)) {
+            ++line_no;
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::stringstream ss(line);
+            std::string x_str, y_str;
+            if (!std::getline(ss, x_str, ',') || !std::getline(ss, y_str)) {
+                std::cerr << "[M20PolicyRunner] Invalid csv line " << line_no
+                          << ": " << line << std::endl;
+                continue;
+            }
+            try {
+                loaded.emplace_back(std::stof(x_str), std::stof(y_str));
+            } catch (const std::exception&) {
+                std::cerr << "[M20PolicyRunner] Parse error at line " << line_no
+                          << ": " << line << std::endl;
+            }
+        }
+
+        if (loaded.empty()) {
+            std::cerr << "[M20PolicyRunner] No valid waypoints in csv: "
+                      << csv_path << std::endl;
+            return false;
+        }
+        waypoints_xy_ = std::move(loaded);
+        std::cout << "[M20PolicyRunner] Loaded " << waypoints_xy_.size()
+                  << " waypoints from " << csv_path << std::endl;
+        return true;
+    }
+
 public:
     M20PolicyRunner(const std::string &policy_name, const std::string &policy_path) :
             PolicyRunnerBase(policy_name), policy_path_(policy_path),env_(ORT_LOGGING_LEVEL_WARNING, "M20PolicyRunner"),
@@ -146,13 +204,9 @@ public:
 
         memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-        waypoints_xy_ = {
-            Eigen::Vector2f(0.0f, -0.5f),
-            Eigen::Vector2f(1.0f, 0.5f),
-            Eigen::Vector2f(2.0f, -0.5f),
-            Eigen::Vector2f(1.0f, 0.5f),
-            Eigen::Vector2f(0.0f, -0.5f),
-        };
+        if (!LoadWaypointsFromCsv()) {
+            throw std::runtime_error("Failed to load waypoints from csv");
+        }
     }
 
     ~M20PolicyRunner() override = default;
