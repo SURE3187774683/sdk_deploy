@@ -147,8 +147,8 @@ def _generate_fixed_curve_waypoints(cfg: dict, initial_heading_w: float = 0.0):
     elif path_type == 4: # 螺旋 (Spiral)
         growth = float(cfg.get("spiral_growth", 0.3))
         t_end = ncycles * 2.0 * kPi
-        curve_fn = lambda t, _g=growth: np.array(
-            [_g * t * np.cos(t), _g * t * np.sin(t)], dtype=np.float32)
+        curve_fn = lambda t, _g=growth, _s=scale: np.array(
+            [_s * _g * t * np.cos(t), _s * _g * t * np.sin(t)], dtype=np.float32)
     elif path_type == 5: # 椭圆 (Ellipse)
         b = scale * float(cfg.get("ellipse_b_ratio", 0.5))
         t_end = ncycles * 2.0 * kPi
