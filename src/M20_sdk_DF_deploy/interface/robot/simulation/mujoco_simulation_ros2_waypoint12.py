@@ -48,7 +48,7 @@ def _resolve_waypoint_cfg_path() -> Path:
         p = Path(env_path).expanduser().resolve()
         if p.is_file():
             return p
-    return (CURRENT_DIR / ".." / ".." / ".." / "config" / "waypoint_rect.cfg").resolve()
+    return (CURRENT_DIR / ".." / ".." / ".." / "config" / "waypoint_path.cfg").resolve()
 
 
 def _load_waypoint_rect_cfg() -> dict:
@@ -56,9 +56,16 @@ def _load_waypoint_rect_cfg() -> dict:
     if not cfg_path.is_file():
         raise FileNotFoundError(f"Waypoint cfg not found: {cfg_path}")
     cfg = {
-        "length_x": 16.0,
-        "width_y": 8.0,
-        "num_points": 11,
+        "num_waypoints": 100,
+        "r_min": 0.2,
+        "r_max": 0.2,
+        "theta_min": -0.05,
+        "theta_max": 0.05,
+        "point_move_vE_min": 0.5,
+        "point_move_vE_max": 2.5,
+        "point_move_vE_cycle_min_points": 50,
+        "point_move_vE_cycle_max_points": 100,
+        "target_z": 0.45,
         "seed": 42,
     }
     with cfg_path.open("r", encoding="utf-8") as f:
@@ -69,11 +76,11 @@ def _load_waypoint_rect_cfg() -> dict:
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip()
-            if k in ("length_x", "width_y"):
+            if k in ("r_min", "r_max", "theta_min", "theta_max", "point_move_vE_min", "point_move_vE_max", "target_z"):
                 cfg[k] = float(v)
-            elif k in ("num_points", "seed"):
+            elif k in ("num_waypoints", "point_move_vE_cycle_min_points", "point_move_vE_cycle_max_points", "seed"):
                 cfg[k] = int(v)
-    if cfg["num_points"] < 2 or cfg["length_x"] <= 0.0 or cfg["width_y"] <= 0.0:
+    if cfg["num_waypoints"] < 2 or cfg["r_min"] <= 0.0 or cfg["r_max"] < cfg["r_min"]:
         raise ValueError(f"Invalid waypoint cfg: {cfg}")
     return cfg
 
@@ -122,7 +129,7 @@ class MuJoCoSimulationWaypointNode(Node):
         self.wp_idx = 0
         self.waypoint_origin_xy = self.data.qpos[:2].copy().astype(np.float32)
         yaw0 = float(self.quaternion_to_euler(self.data.qpos[3:7].copy())[2])
-        self.waypoints_xy = self._generate_world_waypoints(self.waypoint_origin_xy, yaw0)
+        self.waypoints_xy, self.waypoints_vE = self._generate_world_waypoints(self.waypoint_origin_xy, yaw0)
         self.wp_total = self.waypoints_xy.shape[0]
 
         self.get_logger().info(f"[INFO] MuJoCo model loaded, dof={self.dof_num}, waypoints={self.wp_total}")
@@ -198,9 +205,10 @@ class MuJoCoSimulationWaypointNode(Node):
     def wrap_to_pi(angle):
         return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
-    def _generate_world_waypoints(self, origin_xy: np.ndarray, yaw0: float) -> np.ndarray:
-        n = int(WAYPOINT_CFG["num_points"])
+    def _generate_world_waypoints(self, origin_xy: np.ndarray, yaw0: float):
+        n = int(WAYPOINT_CFG["num_waypoints"])
         local = np.zeros((n, 2), dtype=np.float32)
+        vmag = np.zeros((n,), dtype=np.float32)
         state = (int(WAYPOINT_CFG["seed"]) & 0xFFFFFFFF) if int(WAYPOINT_CFG["seed"]) >= 0 else (int(time.time()) & 0xFFFFFFFF)
 
         def next_rand01() -> float:
@@ -208,15 +216,38 @@ class MuJoCoSimulationWaypointNode(Node):
             state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
             return float(state) / 4294967295.0
 
+        ve_cycle_t = 2.0 * next_rand01()
+        pmin = int(WAYPOINT_CFG["point_move_vE_cycle_min_points"])
+        pmax = max(pmin, int(WAYPOINT_CFG["point_move_vE_cycle_max_points"]))
+        period = pmin + int(next_rand01() * (pmax - pmin + 1))
+        # Force first segment to align with robot yaw at sim start.
+        heading = float(yaw0)
+
+        def sample_ve() -> float:
+            nonlocal ve_cycle_t, period
+            vmin = float(WAYPOINT_CFG["point_move_vE_min"])
+            vmax = float(WAYPOINT_CFG["point_move_vE_max"])
+            if vmax <= vmin:
+                return vmin
+            tri = ve_cycle_t if ve_cycle_t < 1.0 else 2.0 - ve_cycle_t
+            speed = vmin + tri * (vmax - vmin)
+            ve_cycle_t += 2.0 / max(1, period)
+            if ve_cycle_t >= 2.0:
+                ve_cycle_t -= 2.0
+                period = pmin + int(next_rand01() * (pmax - pmin + 1))
+            return speed
+
         for i in range(1, n):
-            rx = next_rand01()
-            ry = next_rand01()
-            local[i, 0] = rx * float(WAYPOINT_CFG["length_x"])
-            local[i, 1] = (ry - 0.5) * float(WAYPOINT_CFG["width_y"])
-        c0, s0 = np.cos(yaw0), np.sin(yaw0)
-        rot = np.array([[c0, -s0], [s0, c0]], dtype=np.float32)
-        world = (local @ rot.T) + origin_xy.reshape(1, 2)
-        return world.astype(np.float32)
+            r = float(WAYPOINT_CFG["r_min"]) + next_rand01() * (float(WAYPOINT_CFG["r_max"]) - float(WAYPOINT_CFG["r_min"]))
+            if i > 1:
+                dtheta = (float(WAYPOINT_CFG["theta_min"]) + next_rand01() * (float(WAYPOINT_CFG["theta_max"]) - float(WAYPOINT_CFG["theta_min"]))) * 2.0 * np.pi
+                heading += dtheta
+            local[i, 0] = local[i - 1, 0] + r * np.cos(heading)
+            local[i, 1] = local[i - 1, 1] + r * np.sin(heading)
+            vmag[i - 1] = sample_ve()
+        # Training command uses env-origin translation only (no yaw0 rotation).
+        world = local + origin_xy.reshape(1, 2)
+        return world.astype(np.float32), vmag
 
     def _apply_joint_torque(self):
         q = self.data.qpos[7:7 + self.dof_num].reshape(-1, 1)
@@ -288,6 +319,50 @@ class MuJoCoSimulationWaypointNode(Node):
                 rgba=rgba,
             )
             scn.ngeom += 1
+
+        base_pos = self.data.qpos[:2].copy()
+        yaw = float(self.quaternion_to_euler(self.data.qpos[3:7].copy())[2])
+        base_dir = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float32)
+        self._render_arrow_2d(scn, base_pos, base_pos + 0.8 * base_dir, np.array([0.2, 0.4, 1.0, 1.0], dtype=np.float32), 0.03)
+
+        wp_idx = min(self.wp_idx, self.wp_total - 1)
+        wp = self.waypoints_xy[wp_idx]
+        ve = float(self.waypoints_vE[wp_idx]) if wp_idx < len(self.waypoints_vE) else 0.0
+        if wp_idx < self.wp_total - 1:
+            seg = self.waypoints_xy[wp_idx + 1] - wp
+            nrm = np.linalg.norm(seg)
+            direction = seg / (nrm + 1e-6)
+        else:
+            direction = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float32)
+        self._render_arrow_2d(scn, wp, wp + direction * max(0.2, 0.4 * ve), np.array([1.0, 0.85, 0.1, 1.0], dtype=np.float32), 0.025)
+
+    def _render_arrow_2d(self, scn, p0_xy, p1_xy, rgba, radius):
+        if scn.ngeom >= len(scn.geoms):
+            return
+        p0 = np.array([float(p0_xy[0]), float(p0_xy[1]), 0.08], dtype=np.float64)
+        p1 = np.array([float(p1_xy[0]), float(p1_xy[1]), 0.08], dtype=np.float64)
+        center = 0.5 * (p0 + p1)
+        vec = p1 - p0
+        length = np.linalg.norm(vec)
+        if length < 1e-6:
+            return
+        z = vec / length
+        ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(np.dot(z, ref)) > 0.99:
+            ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        x = np.cross(ref, z)
+        x /= np.linalg.norm(x)
+        y = np.cross(z, x)
+        mat = np.stack([x, y, z], axis=1).reshape(-1)
+        mujoco.mjv_initGeom(
+            scn.geoms[scn.ngeom],
+            type=mujoco.mjtGeom.mjGEOM_ARROW,
+            size=np.array([radius, radius, 0.5 * length], dtype=np.float64),
+            pos=center,
+            mat=mat,
+            rgba=rgba,
+        )
+        scn.ngeom += 1
 
     def _publish_robot_state(self):
         q_world = self.data.sensordata[:4]
