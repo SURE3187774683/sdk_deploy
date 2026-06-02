@@ -162,18 +162,13 @@ def _generate_fixed_curve_waypoints(cfg: dict, initial_heading_w: float = 0.0):
         curve_fn = lambda t, _s=scale, _nd=nd: np.array(
             [_s * np.cos(_nd * t) * np.cos(t),
              _s * np.cos(_nd * t) * np.sin(t)], dtype=np.float32)
-    elif path_type == 7: # 摆线 (Cycloid)
-        r = scale * 0.5
-        t_end = ncycles * 2.0 * kPi
-        curve_fn = lambda t, _r=r: np.array(
-            [_r * (t - np.sin(t)), _r * (1.0 - np.cos(t))], dtype=np.float32)
-    elif path_type == 8: # 次摆线 (Trochoid)
+    elif path_type == 7: # 次摆线 (Trochoid)
         R = scale * 0.5
         D = R * float(cfg.get("trochoid_d_ratio", 0.5))
         t_end = ncycles * 2.0 * kPi
         curve_fn = lambda t, _R=R, _D=D: np.array(
             [_R * t - _D * np.sin(t), _R - _D * np.cos(t)], dtype=np.float32)
-    elif path_type == 9: # 内旋轮线 (Hypocycloid)
+    elif path_type == 8: # 内旋轮线 (Hypocycloid)
         R   = scale
         k   = max(2.0, float(cfg.get("hypocycloid_R_ratio", 4.0)))
         r_in = R / k

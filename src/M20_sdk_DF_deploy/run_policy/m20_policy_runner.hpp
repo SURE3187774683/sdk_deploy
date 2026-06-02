@@ -116,8 +116,7 @@ private:
         // ── Fixed-curve parameters ────────────────────────────────────────────
         // path_type: 0=random(随机)      1=figure-eight(8字形)  2=s-curve(S型)
         //            3=circle(圆形)      4=spiral(螺旋)         5=ellipse(椭圆)
-        //            6=rose(玫瑰线)      7=cycloid(摆线)        8=trochoid(次摆线)
-        //            9=hypocycloid(内旋轮线)
+        //            6=rose(玫瑰线)      7=trochoid(次摆线)        8=hypocycloid(内旋轮线)
         int   path_type           = 0;     // 0=random; 1-9=fixed curves
         float curve_scale         = 3.0f;  // 固定曲线整体尺寸(m)
         float point_spacing       = 0.2f;  // 等弧长采样间距(m), path_type>0 时有效
@@ -359,19 +358,8 @@ private:
                 };
                 break;
             }
-            // ── 7. 摆线 (Cycloid) ─────────────────────────────────────────
+            // ── 7. 次摆线 (Trochoid) ───────────────────────────────────────
             case 7: {
-                // r chosen so arch height = scale; x = r*(t-sin t), y = r*(1-cos t)
-                const float r = scale * 0.5f;
-                t_end = ncycles * 2.0f * kPi;
-                curve_fn = [r](float t) -> Eigen::Vector2f {
-                    return {r * (t - std::sin(t)),
-                            r * (1.0f - std::cos(t))};
-                };
-                break;
-            }
-            // ── 8. 次摆线 (Trochoid) ───────────────────────────────────────
-            case 8: {
                 // x = R*t - d*sin(t),  y = R - d*cos(t)
                 // d/R < 1: curtate (scalloped); d/R = 1: cycloid; d/R > 1: prolate (loops)
                 const float R = scale * 0.5f;
@@ -383,8 +371,8 @@ private:
                 };
                 break;
             }
-            // ── 9. 内旋轮线 (Hypocycloid / Hypotrochoid) ───────────────────────
-            case 9: {
+            // ── 8. 内旋轮线 (Hypocycloid / Hypotrochoid) ───────────────────────
+            case 8: {
                 // R = outer radius, r_in = inner radius, D = pen distance
                 // k = R/r_in (integer => standard hypocycloid; e.g. k=4 => astroid)
                 const float R     = scale;
