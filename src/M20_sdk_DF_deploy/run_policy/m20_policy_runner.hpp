@@ -191,10 +191,13 @@ private:
             }
         }
 
-        if (waypoint_cfg_.num_waypoints < 2 || waypoint_cfg_.r_min <= 0.0f || waypoint_cfg_.r_max < waypoint_cfg_.r_min) {
-            std::cerr << "[M20PolicyRunner] Invalid waypoint cfg values in: "
-                      << cfg_path << std::endl;
-            return false;
+        // Validation: random mode needs num_waypoints/r_min/r_max; fixed-curve mode is less strict
+        if (waypoint_cfg_.path_type == 0) {
+            if (waypoint_cfg_.num_waypoints < 2 || waypoint_cfg_.r_min <= 0.0f || waypoint_cfg_.r_max < waypoint_cfg_.r_min) {
+                std::cerr << "[M20PolicyRunner] Invalid waypoint cfg values in: "
+                          << cfg_path << std::endl;
+                return false;
+            }
         }
         waypoint_reach_threshold_ = waypoint_cfg_.reach_threshold;
         std::cout << "[M20PolicyRunner] Waypoint cfg loaded from " << cfg_path
@@ -323,11 +326,11 @@ private:
             }
             // ── 4. 螺旋 (Archimedean Spiral) ────────────────────────────────
             case 4: {
-                // r = spiral_growth * theta; starts at origin
+                // r = scale * spiral_growth * theta; starts at origin
                 const float growth = waypoint_cfg_.spiral_growth;
                 t_end = ncycles * 2.0f * kPi;
-                curve_fn = [growth](float t) -> Eigen::Vector2f {
-                    const float r = growth * t;
+                curve_fn = [scale, growth](float t) -> Eigen::Vector2f {
+                    const float r = scale * growth * t;
                     return {r * std::cos(t), r * std::sin(t)};
                 };
                 break;
