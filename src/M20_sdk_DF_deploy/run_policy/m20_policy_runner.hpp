@@ -21,6 +21,7 @@
 #include <sstream>
 #include <filesystem>
 #include <cstdlib>
+#include <functional>
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_c_api.h>
 
@@ -112,6 +113,22 @@ private:
         float reach_threshold = 0.05f;
         float target_z = 0.45f;
         int seed = 42;
+        // ── Fixed-curve parameters ────────────────────────────────────────────
+        // path_type: 0=random(随机)      1=figure-eight(8字形)  2=s-curve(S型)
+        //            3=circle(圆形)      4=spiral(螺旋)         5=ellipse(椭圆)
+        //            6=rose(玫瑰线)      7=cycloid(摆线)        8=trochoid(次摆线)
+        //            9=hypocycloid(内旋轮线)
+        int   path_type           = 0;     // 0=random; 1-9=fixed curves
+        float curve_scale         = 3.0f;  // 固定曲线整体尺寸(m)
+        float point_spacing       = 0.2f;  // 等弧长采样间距(m), path_type>0 时有效
+        float curve_num_cycles    = 3.0f;  // 循环圈数(螺旋/摆线/次摆线/S型)
+        int   rose_n              = 3;     // 玫瑰线 n 参数
+        int   rose_d              = 1;     // 玫瑰线 d 参数
+        float ellipse_b_ratio     = 0.5f;  // 椭圆短轴/长轴比
+        float spiral_growth       = 0.3f;  // 螺旋每弧度径向增长 (m/rad)
+        float trochoid_d_ratio    = 0.5f;  // 次摆线 d/R 比
+        float hypocycloid_R_ratio = 4.0f;  // 内旋轮线 R/r 比
+        float hypocycloid_d_ratio = 1.0f;  // 内旋轮线 d/r 比
     };
     WaypointPathConfig waypoint_cfg_;
     float ve_cycle_t_ = 0.0f;
@@ -158,7 +175,18 @@ private:
                 else if (key == "obs_num_points") waypoint_cfg_.obs_num_points = std::stoi(val);
                 else if (key == "reach_threshold") waypoint_cfg_.reach_threshold = std::stof(val);
                 else if (key == "target_z") waypoint_cfg_.target_z = std::stof(val);
-                else if (key == "seed") waypoint_cfg_.seed = std::stoi(val);
+                else if (key == "seed")                waypoint_cfg_.seed                = std::stoi(val);
+                else if (key == "path_type")           waypoint_cfg_.path_type           = std::stoi(val);
+                else if (key == "curve_scale")         waypoint_cfg_.curve_scale         = std::stof(val);
+                else if (key == "point_spacing")       waypoint_cfg_.point_spacing       = std::stof(val);
+                else if (key == "curve_num_cycles")    waypoint_cfg_.curve_num_cycles    = std::stof(val);
+                else if (key == "rose_n")              waypoint_cfg_.rose_n              = std::stoi(val);
+                else if (key == "rose_d")              waypoint_cfg_.rose_d              = std::stoi(val);
+                else if (key == "ellipse_b_ratio")     waypoint_cfg_.ellipse_b_ratio     = std::stof(val);
+                else if (key == "spiral_growth")       waypoint_cfg_.spiral_growth       = std::stof(val);
+                else if (key == "trochoid_d_ratio")    waypoint_cfg_.trochoid_d_ratio    = std::stof(val);
+                else if (key == "hypocycloid_R_ratio") waypoint_cfg_.hypocycloid_R_ratio = std::stof(val);
+                else if (key == "hypocycloid_d_ratio") waypoint_cfg_.hypocycloid_d_ratio = std::stof(val);
             } catch (const std::exception&) {
                 std::cerr << "[M20PolicyRunner] Invalid cfg item: " << line << std::endl;
             }
@@ -172,10 +200,13 @@ private:
         waypoint_reach_threshold_ = waypoint_cfg_.reach_threshold;
         std::cout << "[M20PolicyRunner] Waypoint cfg loaded from " << cfg_path
                   << " (num_waypoints=" << waypoint_cfg_.num_waypoints
+                  << ", path_type=" << waypoint_cfg_.path_type
                   << ", r=[" << waypoint_cfg_.r_min << "," << waypoint_cfg_.r_max << "]"
                   << ", theta=[" << waypoint_cfg_.theta_min << "," << waypoint_cfg_.theta_max << "]"
                   << ", obs_num_points=" << waypoint_cfg_.obs_num_points
-                  << ", seed=" << waypoint_cfg_.seed << ")" << std::endl;
+                  << ", seed=" << waypoint_cfg_.seed
+                  << ", curve_scale=" << waypoint_cfg_.curve_scale
+                  << ", point_spacing=" << waypoint_cfg_.point_spacing << ")" << std::endl;
         return true;
     }
 
@@ -207,9 +238,231 @@ private:
         return speed;
     }
 
+    // ── Equal arc-length sampling helper ────────────────────────────────
+    // Densely samples a parametric curve then resamples at equal arc spacing.
+    std::vector<Eigen::Vector2f> EqualArcLengthSample(
+        std::function<Eigen::Vector2f(float)> curve_fn,
+        float t_start, float t_end,
+        float spacing,
+        int   max_points = 10000)
+    {
+        constexpr int N_DENSE = 20000;
+        std::vector<Eigen::Vector2f> dense;
+        dense.reserve(N_DENSE + 1);
+        for (int i = 0; i <= N_DENSE; ++i) {
+            float t = t_start + (t_end - t_start) * static_cast<float>(i) / static_cast<float>(N_DENSE);
+            dense.push_back(curve_fn(t));
+        }
+        // Cumulative arc lengths
+        std::vector<float> arc(N_DENSE + 1, 0.0f);
+        for (int i = 1; i <= N_DENSE; ++i) {
+            arc[i] = arc[i - 1] + (dense[i] - dense[i - 1]).norm();
+        }
+        const float total_arc = arc.back();
+        if (total_arc < 1e-6f || spacing < 1e-6f) return {dense[0]};
+
+        const int n_pts = std::min(max_points,
+                                   static_cast<int>(total_arc / spacing) + 2);
+        std::vector<Eigen::Vector2f> result;
+        result.reserve(n_pts);
+        result.push_back(dense[0]);
+        int j = 0;
+        for (int k = 1; k < n_pts; ++k) {
+            const float target = static_cast<float>(k) * spacing;
+            if (target >= total_arc) break;
+            while (j < N_DENSE - 1 && arc[j + 1] < target) ++j;
+            const float denom = arc[j + 1] - arc[j];
+            const float frac  = (denom > 1e-9f) ? (target - arc[j]) / denom : 0.0f;
+            result.push_back(dense[j] + frac * (dense[j + 1] - dense[j]));
+        }
+        return result;
+    }
+
+    // ── Fixed-curve waypoint generator ────────────────────────────────────
+    // Generates waypoints_xy_ / waypoints_vE_ for a deterministic parametric curve.
+    // All curves are translated so their first sampled point becomes the origin,
+    // then rotated by initial_heading_w so the curve faces the robot's forward direction.
+    void GenerateFixedCurveWaypoints(float initial_heading_w = 0.0f) {
+        const float scale   = waypoint_cfg_.curve_scale;
+        const float spacing = waypoint_cfg_.point_spacing;
+        const float ncycles = waypoint_cfg_.curve_num_cycles;
+        const float kPi     = static_cast<float>(M_PI);
+
+        std::function<Eigen::Vector2f(float)> curve_fn;
+        float t_start = 0.0f, t_end = 2.0f * kPi;
+
+        switch (waypoint_cfg_.path_type) {
+            // ── 1. 8字形 (Figure-Eight, Lissajous) ─────────────────────────────
+            case 1: {
+                // x = scale*sin(t), y = 0.5*scale*sin(2t)  -- passes through (0,0) at t=0
+                curve_fn = [scale](float t) -> Eigen::Vector2f {
+                    return {scale * std::sin(t),
+                            scale * 0.5f * std::sin(2.0f * t)};
+                };
+                t_end = 2.0f * kPi;
+                break;
+            }
+            // ── 2. S型 (S-Curve, sinusoidal forward motion) ───────────────────────
+            case 2: {
+                // x advances scale meters per cycle; y oscillates ±0.3*scale
+                t_end = ncycles * 2.0f * kPi;
+                curve_fn = [scale, kPi](float t) -> Eigen::Vector2f {
+                    return {scale * t / (2.0f * kPi),
+                            scale * 0.3f * std::sin(t)};
+                };
+                break;
+            }
+            // ── 3. 圆形 (Circle) ─────────────────────────────────────────
+            case 3: {
+                // Starts at bottom of circle so first point = (0,0), tangent = +x
+                t_end = ncycles * 2.0f * kPi;
+                curve_fn = [scale](float t) -> Eigen::Vector2f {
+                    return {scale * std::sin(t),
+                            scale * (1.0f - std::cos(t))};
+                };
+                break;
+            }
+            // ── 4. 螺旋 (Archimedean Spiral) ────────────────────────────────
+            case 4: {
+                // r = spiral_growth * theta; starts at origin
+                const float growth = waypoint_cfg_.spiral_growth;
+                t_end = ncycles * 2.0f * kPi;
+                curve_fn = [growth](float t) -> Eigen::Vector2f {
+                    const float r = growth * t;
+                    return {r * std::cos(t), r * std::sin(t)};
+                };
+                break;
+            }
+            // ── 5. 椭圆 (Ellipse) ─────────────────────────────────────────
+            case 5: {
+                // Semi-axes: a=scale (x), b=scale*b_ratio (y); same start trick as circle
+                const float b = scale * waypoint_cfg_.ellipse_b_ratio;
+                t_end = ncycles * 2.0f * kPi;
+                curve_fn = [scale, b](float t) -> Eigen::Vector2f {
+                    return {scale * std::sin(t),
+                            b     * (1.0f - std::cos(t))};
+                };
+                break;
+            }
+            // ── 6. 玫瑰线 (Rose Curve, r = scale*cos(n/d * t)) ──────────────────
+            case 6: {
+                const int n  = std::max(1, waypoint_cfg_.rose_n);
+                const int d  = std::max(1, waypoint_cfg_.rose_d);
+                const float nd = static_cast<float>(n) / static_cast<float>(d);
+                // Minimum period to close: 2*pi*d if n*d even, pi*d if n*d odd
+                t_end = ((n * d) % 2 == 0)
+                        ? 2.0f * kPi * static_cast<float>(d)
+                        :        kPi * static_cast<float>(d);
+                curve_fn = [scale, nd](float t) -> Eigen::Vector2f {
+                    const float r = scale * std::cos(nd * t);
+                    return {r * std::cos(t), r * std::sin(t)};
+                };
+                break;
+            }
+            // ── 7. 摆线 (Cycloid) ─────────────────────────────────────────
+            case 7: {
+                // r chosen so arch height = scale; x = r*(t-sin t), y = r*(1-cos t)
+                const float r = scale * 0.5f;
+                t_end = ncycles * 2.0f * kPi;
+                curve_fn = [r](float t) -> Eigen::Vector2f {
+                    return {r * (t - std::sin(t)),
+                            r * (1.0f - std::cos(t))};
+                };
+                break;
+            }
+            // ── 8. 次摆线 (Trochoid) ───────────────────────────────────────
+            case 8: {
+                // x = R*t - d*sin(t),  y = R - d*cos(t)
+                // d/R < 1: curtate (scalloped); d/R = 1: cycloid; d/R > 1: prolate (loops)
+                const float R = scale * 0.5f;
+                const float D = R * waypoint_cfg_.trochoid_d_ratio;
+                t_end = ncycles * 2.0f * kPi;
+                curve_fn = [R, D](float t) -> Eigen::Vector2f {
+                    return {R * t - D * std::sin(t),
+                            R - D * std::cos(t)};
+                };
+                break;
+            }
+            // ── 9. 内旋轮线 (Hypocycloid / Hypotrochoid) ───────────────────────
+            case 9: {
+                // R = outer radius, r_in = inner radius, D = pen distance
+                // k = R/r_in (integer => standard hypocycloid; e.g. k=4 => astroid)
+                const float R     = scale;
+                const float k     = std::max(2.0f, waypoint_cfg_.hypocycloid_R_ratio);
+                const float r_in  = R / k;
+                const float D     = r_in * waypoint_cfg_.hypocycloid_d_ratio;
+                const float ratio = (R - r_in) / r_in; // = k - 1
+                t_end = 2.0f * kPi; // closes after 2*pi when k is integer
+                curve_fn = [R, r_in, D, ratio](float t) -> Eigen::Vector2f {
+                    const float x = (R - r_in) * std::cos(t) + D * std::cos(ratio * t);
+                    const float y = (R - r_in) * std::sin(t) - D * std::sin(ratio * t);
+                    return {x, y};
+                };
+                break;
+            }
+            default: {
+                std::cerr << "[M20PolicyRunner] Unknown path_type="
+                          << waypoint_cfg_.path_type
+                          << ", falling back to random." << std::endl;
+                return; // caller detects empty waypoints_xy_ and uses random
+            }
+        } // switch
+
+        // — Equal arc-length sampling —
+        auto raw = EqualArcLengthSample(curve_fn, t_start, t_end, spacing);
+        if (raw.empty()) return;
+
+        // — Translate so first sampled point is at origin —
+        const Eigen::Vector2f first_pt = raw[0];
+        for (auto& p : raw) p -= first_pt;
+
+        // — Rotate by initial_heading_w so curve's +x aligns with robot's forward —
+        const float ch = std::cos(initial_heading_w);
+        const float sh = std::sin(initial_heading_w);
+        for (auto& p : raw) {
+            const float xr = ch * p.x() - sh * p.y();
+            const float yr = sh * p.x() + ch * p.y();
+            p = {xr, yr};
+        }
+
+        waypoints_xy_ = std::move(raw);
+
+        // Apply cyclic velocity variation (same as random mode) so vE_min/vE_max work
+        {
+            uint32_t ve_state = (waypoint_cfg_.seed >= 0)
+                ? static_cast<uint32_t>(waypoint_cfg_.seed)
+                : static_cast<uint32_t>(std::time(nullptr));
+            ve_cycle_t_ = 2.0f * Rand01(ve_state);
+            ve_cycle_period_pts_ = RandInt(ve_state,
+                waypoint_cfg_.point_move_vE_cycle_min_points,
+                waypoint_cfg_.point_move_vE_cycle_max_points);
+            waypoints_vE_.resize(waypoints_xy_.size());
+            for (size_t i = 0; i < waypoints_xy_.size(); ++i) {
+                waypoints_vE_[i] = SampleCyclicVEMag(ve_state);
+            }
+        }
+
+        std::cout << "[M20PolicyRunner] Fixed curve type=" << waypoint_cfg_.path_type
+                  << " generated " << waypoints_xy_.size() << " waypoints"
+                  << ", scale=" << scale
+                  << ", spacing=" << spacing
+                  << ", vE=[" << waypoint_cfg_.point_move_vE_min
+                  << "," << waypoint_cfg_.point_move_vE_max << "]" << std::endl;
+    }
+
     void GenerateWaypoints(float initial_heading_w = 0.0f) {
         waypoints_xy_.clear();
         waypoints_vE_.clear();
+
+        // Dispatch to fixed-curve generator when path_type > 0
+        if (waypoint_cfg_.path_type > 0) {
+            GenerateFixedCurveWaypoints(initial_heading_w);
+            if (!waypoints_xy_.empty()) return;
+            std::cerr << "[M20PolicyRunner] Fixed curve generation failed, "
+                         "falling back to random." << std::endl;
+        }
+
+        // — Original random waypoint generation —
         waypoints_xy_.reserve(static_cast<size_t>(waypoint_cfg_.num_waypoints));
         waypoints_vE_.assign(static_cast<size_t>(waypoint_cfg_.num_waypoints), 0.0f);
         waypoints_xy_.emplace_back(0.0f, 0.0f);
@@ -537,5 +790,31 @@ public:
     double getCurrentTime() {
         clock_gettime(1, &system_time);
         return system_time.tv_sec + system_time.tv_nsec / 1e9;
+    }
+
+    // ── Waypoint data access for ROS2 publishing ─────────────────────────
+    bool IsWaypointOriginInitialized() const { return waypoint_origin_initialized_; }
+
+    int GetWaypointIdx() const { return waypoint_idx_; }
+
+    /** Serialize all waypoint data into a flat float vector for publishing.
+     *  Layout: [wp_idx, N, x0,y0, x1,y1, ... (world frame), vE0, vE1, ...]
+     *  Returns empty vector if waypoint origin is not yet initialized. */
+    std::vector<float> SerializeWaypointPath() const {
+        std::vector<float> data;
+        if (!waypoint_origin_initialized_ || waypoints_xy_.empty()) return data;
+        const auto N = static_cast<float>(waypoints_xy_.size());
+        data.reserve(2 + static_cast<size_t>(N) * 3);
+        data.push_back(static_cast<float>(waypoint_idx_));
+        data.push_back(N);
+        for (const auto& p : waypoints_xy_) {
+            Eigen::Vector2f world = LocalWaypointToWorld(p);
+            data.push_back(world(0));
+            data.push_back(world(1));
+        }
+        for (float v : waypoints_vE_) {
+            data.push_back(v);
+        }
+        return data;
     }
 };

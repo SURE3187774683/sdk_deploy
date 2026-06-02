@@ -12,6 +12,7 @@
 
 #include "common_types.h"
 #include <atomic>
+#include <vector>
 #include "rclcpp/rclcpp.hpp"
 using namespace types;
 
@@ -171,6 +172,13 @@ public:
     }
 
     virtual void RefreshRobotData(){
+    }
+
+    /**
+     * @brief Publish waypoint path data for MuJoCo visualization synchronization.
+     * @param waypoint_data  Flat float vector: [wp_idx, N, x0,y0, ..., vE0, vE1, ...]
+     */
+    virtual void PublishWaypointPath(const std::vector<float>& /*waypoint_data*/) {
     }
 };
 

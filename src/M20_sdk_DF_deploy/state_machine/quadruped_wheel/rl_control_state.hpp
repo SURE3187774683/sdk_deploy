@@ -69,6 +69,12 @@ namespace qw {
                     MatXf res = ra.ConvertToMat();
 
                     ri_ptr_->SetJointCommand(res);
+
+                    // Publish C++ policy's waypoint path for MuJoCo visualization sync
+                    if (m20_policy_ && m20_policy_->IsWaypointOriginInitialized()) {
+                        ri_ptr_->PublishWaypointPath(m20_policy_->SerializeWaypointPath());
+                    }
+
                     run_cnt_record = state_run_cnt_;
                     clock_gettime(CLOCK_MONOTONIC, &end_timestamp);
                     policy_cost_time_ = (end_timestamp.tv_sec - start_timestamp.tv_sec) * 1e3

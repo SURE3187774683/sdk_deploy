@@ -59,6 +59,7 @@ protected:
     rclcpp::Subscription<drdds::msg::BatteryData>::SharedPtr health_data_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr slam_odom_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr base_pose_sub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr waypoint_path_pub_;
 
 
     bool IsDataUpdatedFinished() {
@@ -163,6 +164,8 @@ public:
         base_pose_sub_ = node_->create_subscription<std_msgs::msg::Float32MultiArray>(
                                     "/BASE_POSE2D", 10,
                                     std::bind(&DdsInterface::HandlerBasePose, this, std::placeholders::_1));
+        waypoint_path_pub_ = node_->create_publisher<std_msgs::msg::Float32MultiArray>(
+                                    "/WAYPOINT_PATH", 10);
         
         sleep(1);
 
@@ -330,5 +333,12 @@ public:
             return;
         }
         base_pos_w_ << msg->data[0], msg->data[1], msg->data[2];
+    }
+
+    void PublishWaypointPath(const std::vector<float>& waypoint_data) override {
+        if (waypoint_data.empty()) return;
+        auto msg = std_msgs::msg::Float32MultiArray();
+        msg.data = waypoint_data;
+        waypoint_path_pub_->publish(msg);
     }
 };

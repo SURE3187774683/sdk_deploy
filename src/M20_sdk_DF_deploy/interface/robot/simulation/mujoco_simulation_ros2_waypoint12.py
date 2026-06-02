@@ -52,22 +52,19 @@ def _resolve_waypoint_cfg_path() -> Path:
 
 
 def _load_waypoint_rect_cfg() -> dict:
+    """Read all parameters directly from waypoint_path.cfg (no hardcoded defaults)."""
     cfg_path = _resolve_waypoint_cfg_path()
     if not cfg_path.is_file():
         raise FileNotFoundError(f"Waypoint cfg not found: {cfg_path}")
-    cfg = {
-        "num_waypoints": 100,
-        "r_min": 0.2,
-        "r_max": 0.2,
-        "theta_min": -0.05,
-        "theta_max": 0.05,
-        "point_move_vE_min": 0.5,
-        "point_move_vE_max": 2.5,
-        "point_move_vE_cycle_min_points": 50,
-        "point_move_vE_cycle_max_points": 100,
-        "target_z": 0.45,
-        "seed": 42,
-    }
+    _float_keys = {"r_min", "r_max", "theta_min", "theta_max",
+                   "point_move_vE_min", "point_move_vE_max", "target_z",
+                   "curve_scale", "point_spacing", "curve_num_cycles",
+                   "ellipse_b_ratio", "spiral_growth", "trochoid_d_ratio",
+                   "hypocycloid_R_ratio", "hypocycloid_d_ratio"}
+    _int_keys   = {"num_waypoints", "point_move_vE_cycle_min_points",
+                   "point_move_vE_cycle_max_points", "seed",
+                   "path_type", "rose_n", "rose_d"}
+    cfg: dict = {}
     with cfg_path.open("r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -76,16 +73,157 @@ def _load_waypoint_rect_cfg() -> dict:
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip()
-            if k in ("r_min", "r_max", "theta_min", "theta_max", "point_move_vE_min", "point_move_vE_max", "target_z"):
+            if k in _float_keys:
                 cfg[k] = float(v)
-            elif k in ("num_waypoints", "point_move_vE_cycle_min_points", "point_move_vE_cycle_max_points", "seed"):
+            elif k in _int_keys:
                 cfg[k] = int(v)
-    if cfg["num_waypoints"] < 2 or cfg["r_min"] <= 0.0 or cfg["r_max"] < cfg["r_min"]:
-        raise ValueError(f"Invalid waypoint cfg: {cfg}")
+    # Validate: random mode needs r_min/r_max; fixed-curve mode is less strict
+    if cfg.get("path_type", 0) == 0:
+        if cfg.get("num_waypoints", 0) < 2 or cfg.get("r_min", 0.0) <= 0.0 or cfg.get("r_max", 0.0) < cfg.get("r_min", 0.0):
+            raise ValueError(f"Invalid waypoint cfg: {cfg}")
     return cfg
 
 
 WAYPOINT_CFG = _load_waypoint_rect_cfg()
+
+
+# ── Fixed-curve trajectory helpers (mirrors C++ GenerateFixedCurveWaypoints) ──
+
+def _equal_arc_length_sample(curve_fn, t_start, t_end, spacing, max_points=10000):
+    """Densely sample a parametric curve, then resample at equal arc-length spacing."""
+    N_DENSE = 20000
+    ts = np.linspace(t_start, t_end, N_DENSE + 1, dtype=np.float64)
+    dense = np.array([curve_fn(t) for t in ts], dtype=np.float32)
+
+    diffs = np.diff(dense, axis=0)
+    seg_len = np.linalg.norm(diffs, axis=1)
+    arc = np.zeros(N_DENSE + 1, dtype=np.float32)
+    arc[1:] = np.cumsum(seg_len)
+    total_arc = float(arc[-1])
+    if total_arc < 1e-6 or spacing < 1e-6:
+        return dense[:1].copy()
+
+    n_pts = min(max_points, int(total_arc / spacing) + 2)
+    result = [dense[0].copy()]
+    j = 0
+    for k in range(1, n_pts):
+        target = k * spacing
+        if target >= total_arc:
+            break
+        while j < N_DENSE - 1 and arc[j + 1] < target:
+            j += 1
+        denom = arc[j + 1] - arc[j]
+        frac = (target - arc[j]) / denom if denom > 1e-9 else 0.0
+        result.append(dense[j] + frac * (dense[j + 1] - dense[j]))
+    return np.array(result, dtype=np.float32)
+
+
+def _generate_fixed_curve_waypoints(cfg: dict, initial_heading_w: float = 0.0):
+    """Generate local-frame waypoints for a fixed parametric curve.
+
+    Returns (waypoints_xy, waypoints_vE) as numpy arrays, or (None, None) on failure.
+    Mirrors the C++ GenerateFixedCurveWaypoints in m20_policy_runner.hpp.
+    """
+    scale   = float(cfg.get("curve_scale", 3.0))
+    spacing = float(cfg.get("point_spacing", 0.2))
+    ncycles = float(cfg.get("curve_num_cycles", 3.0))
+    path_type = int(cfg.get("path_type", 0))
+    kPi = float(np.pi)
+    t_start, t_end = 0.0, 2.0 * kPi
+    curve_fn = None
+
+    if path_type == 1:   # 8字形 (Figure-Eight)
+        curve_fn = lambda t: np.array([scale * np.sin(t),
+                                       scale * 0.5 * np.sin(2.0 * t)], dtype=np.float32)
+        t_end = 2.0 * kPi
+    elif path_type == 2: # S型 (S-Curve)
+        t_end = ncycles * 2.0 * kPi
+        curve_fn = lambda t, _s=scale, _p=kPi: np.array(
+            [_s * t / (2.0 * _p), _s * 0.3 * np.sin(t)], dtype=np.float32)
+    elif path_type == 3: # 圆形 (Circle)
+        t_end = ncycles * 2.0 * kPi
+        curve_fn = lambda t, _s=scale: np.array(
+            [_s * np.sin(t), _s * (1.0 - np.cos(t))], dtype=np.float32)
+    elif path_type == 4: # 螺旋 (Spiral)
+        growth = float(cfg.get("spiral_growth", 0.3))
+        t_end = ncycles * 2.0 * kPi
+        curve_fn = lambda t, _g=growth: np.array(
+            [_g * t * np.cos(t), _g * t * np.sin(t)], dtype=np.float32)
+    elif path_type == 5: # 椭圆 (Ellipse)
+        b = scale * float(cfg.get("ellipse_b_ratio", 0.5))
+        t_end = ncycles * 2.0 * kPi
+        curve_fn = lambda t, _s=scale, _b=b: np.array(
+            [_s * np.sin(t), _b * (1.0 - np.cos(t))], dtype=np.float32)
+    elif path_type == 6: # 玫瑰线 (Rose)
+        n = max(1, int(cfg.get("rose_n", 3)))
+        d = max(1, int(cfg.get("rose_d", 1)))
+        nd = float(n) / float(d)
+        t_end = (2.0 * kPi * float(d)) if (n * d) % 2 == 0 else (kPi * float(d))
+        curve_fn = lambda t, _s=scale, _nd=nd: np.array(
+            [_s * np.cos(_nd * t) * np.cos(t),
+             _s * np.cos(_nd * t) * np.sin(t)], dtype=np.float32)
+    elif path_type == 7: # 摆线 (Cycloid)
+        r = scale * 0.5
+        t_end = ncycles * 2.0 * kPi
+        curve_fn = lambda t, _r=r: np.array(
+            [_r * (t - np.sin(t)), _r * (1.0 - np.cos(t))], dtype=np.float32)
+    elif path_type == 8: # 次摆线 (Trochoid)
+        R = scale * 0.5
+        D = R * float(cfg.get("trochoid_d_ratio", 0.5))
+        t_end = ncycles * 2.0 * kPi
+        curve_fn = lambda t, _R=R, _D=D: np.array(
+            [_R * t - _D * np.sin(t), _R - _D * np.cos(t)], dtype=np.float32)
+    elif path_type == 9: # 内旋轮线 (Hypocycloid)
+        R   = scale
+        k   = max(2.0, float(cfg.get("hypocycloid_R_ratio", 4.0)))
+        r_in = R / k
+        D    = r_in * float(cfg.get("hypocycloid_d_ratio", 1.0))
+        ratio = (R - r_in) / r_in   # = k - 1
+        t_end = 2.0 * kPi
+        curve_fn = lambda t, _R=R, _r=r_in, _D=D, _ratio=ratio: np.array(
+            [(_R - _r) * np.cos(t) + _D * np.cos(_ratio * t),
+             (_R - _r) * np.sin(t) - _D * np.sin(_ratio * t)], dtype=np.float32)
+    else:
+        return None, None
+
+    raw = _equal_arc_length_sample(curve_fn, t_start, t_end, spacing)
+    if len(raw) == 0:
+        return None, None
+
+    # Translate so first sampled point is at origin
+    raw -= raw[0]
+
+    # Rotate by initial_heading_w so curve's +x aligns with robot's forward
+    ch, sh = np.cos(initial_heading_w), np.sin(initial_heading_w)
+    rotated = np.empty_like(raw)
+    rotated[:, 0] = ch * raw[:, 0] - sh * raw[:, 1]
+    rotated[:, 1] = sh * raw[:, 0] + ch * raw[:, 1]
+
+    # Apply cyclic velocity variation (same as random mode) so vE_min/vE_max work
+    vmag = np.zeros(len(rotated), dtype=np.float32)
+    _ve_state = (int(cfg.get("seed", 42)) & 0xFFFFFFFF) if int(cfg.get("seed", 42)) >= 0 else (int(time.time()) & 0xFFFFFFFF)
+    def _next_lcg():
+        nonlocal _ve_state
+        _ve_state = (_ve_state * 1664525 + 1013904223) & 0xFFFFFFFF
+        return float(_ve_state) / 4294967295.0
+    _ve_cycle_t = 2.0 * _next_lcg()
+    _pmin = int(cfg.get("point_move_vE_cycle_min_points", 50))
+    _pmax = max(_pmin, int(cfg.get("point_move_vE_cycle_max_points", 100)))
+    _period = _pmin + int(_next_lcg() * (_pmax - _pmin + 1))
+    for i in range(len(rotated)):
+        vmin = float(cfg.get("point_move_vE_min", 0.5))
+        vmax = float(cfg.get("point_move_vE_max", 2.5))
+        if vmax <= vmin:
+            vmag[i] = vmin
+        else:
+            tri = _ve_cycle_t if _ve_cycle_t < 1.0 else 2.0 - _ve_cycle_t
+            vmag[i] = vmin + tri * (vmax - vmin)
+            _ve_cycle_t += 2.0 / max(1, _period)
+            if _ve_cycle_t >= 2.0:
+                _ve_cycle_t -= 2.0
+                _period = _pmin + int(_next_lcg() * (_pmax - _pmin + 1))
+    return rotated, vmag
+
 
 JOINT_DIR = np.array([1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1, -1], dtype=np.float32)
 POS_OFFSET_DEG = np.array([-25, 229, 160, 0, 25, -131, -200, 0, -25, -229, -160, 0, 25, 131, 200, 0], dtype=np.float32)
@@ -143,6 +281,10 @@ class MuJoCoSimulationWaypointNode(Node):
 
         self.cmd_sub = self.create_subscription(JointsDataCmd, '/JOINTS_CMD', self._cmd_callback, 50)
 
+        # Subscribe to C++ policy's waypoint path for visualization/autopilot sync
+        self._cpp_waypoint_active = False
+        self._cpp_wp_sub = self.create_subscription(Float32MultiArray, '/WAYPOINT_PATH', self._waypoint_path_callback, 10)
+
         self.viewer = mujoco.viewer.launch_passive(self.model, self.data) if USE_VIEWER else None
         if self.viewer:
             self.viewer.opt.frame = mujoco.mjtFrame.mjFRAME_NONE
@@ -173,6 +315,25 @@ class MuJoCoSimulationWaypointNode(Node):
         self.pos_cmd.flat = pub_pos * JOINT_DIR + POS_OFFSET_RAD
         self.vel_cmd.flat = pub_vel * JOINT_DIR
         self.last_cmd_time = self.timestamp
+
+    def _waypoint_path_callback(self, msg: Float32MultiArray):
+        """Receive C++ policy's waypoint path and sync visualization/autopilot."""
+        d = msg.data
+        if len(d) < 2:
+            return
+        wp_idx = int(d[0])
+        N = int(d[1])
+        if N <= 0 or len(d) < 2 + 3 * N:
+            return
+        xy = np.array(d[2:2 + 2 * N], dtype=np.float32).reshape(N, 2)
+        ve = np.array(d[2 + 2 * N:2 + 3 * N], dtype=np.float32)
+        self.waypoints_xy = xy
+        self.waypoints_vE = ve
+        self.wp_idx = wp_idx
+        self.wp_total = N
+        if not self._cpp_waypoint_active:
+            self._cpp_waypoint_active = True
+            self.get_logger().info(f"[WP] C++ waypoint path active: {N} points, idx={wp_idx}")
 
     def _apply_fallback_stand_cmd_if_needed(self):
         if self.last_cmd_time >= 0.0 and (self.timestamp - self.last_cmd_time) < CMD_TIMEOUT_SEC:
@@ -206,6 +367,22 @@ class MuJoCoSimulationWaypointNode(Node):
         return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
     def _generate_world_waypoints(self, origin_xy: np.ndarray, yaw0: float):
+        path_type = int(WAYPOINT_CFG.get("path_type", 0))
+
+        # Dispatch to fixed-curve generator when path_type > 0
+        if path_type > 0:
+            local_xy, vmag = _generate_fixed_curve_waypoints(WAYPOINT_CFG, yaw0)
+            if local_xy is not None and len(local_xy) > 0:
+                world = local_xy + origin_xy.reshape(1, 2)
+                self.get_logger().info(
+                    f"[WP] Fixed curve path_type={path_type}, "
+                    f"n_pts={len(local_xy)}, scale={WAYPOINT_CFG.get('curve_scale', 3.0):.1f}, "
+                    f"spacing={WAYPOINT_CFG.get('point_spacing', 0.2):.2f}"
+                )
+                return world.astype(np.float32), vmag
+            self.get_logger().warn("[WP] Fixed curve generation failed, falling back to random")
+
+        # ── Original random waypoint generation ──────────────────────────────
         n = int(WAYPOINT_CFG["num_waypoints"])
         local = np.zeros((n, 2), dtype=np.float32)
         vmag = np.zeros((n,), dtype=np.float32)
@@ -266,11 +443,15 @@ class MuJoCoSimulationWaypointNode(Node):
         q_world = self.data.qpos[3:7].copy()  # wxyz
         yaw = float(self.quaternion_to_euler(q_world)[2])
 
-        target = self.waypoints_xy[self.wp_idx]
+        # Clamp wp_idx to valid range (C++ publishes the correct index)
+        wp_idx = min(self.wp_idx, self.wp_total - 1)
+        target = self.waypoints_xy[wp_idx]
         delta = target - base_pos
         dist = float(np.linalg.norm(delta))
 
-        if dist < WAYPOINT_REACH_THRESHOLD:
+        # When C++ waypoint data is active, do NOT advance wp_idx independently.
+        # The C++ policy controls waypoint advancement via /WAYPOINT_PATH topic.
+        if not self._cpp_waypoint_active and dist < WAYPOINT_REACH_THRESHOLD:
             self.wp_idx = (self.wp_idx + 1) % self.wp_total
             target = self.waypoints_xy[self.wp_idx]
             delta = target - base_pos
@@ -298,7 +479,8 @@ class MuJoCoSimulationWaypointNode(Node):
         if step % 500 == 0:
             self.get_logger().info(
                 f"[WP] idx={self.wp_idx:02d}, pos=({base_pos[0]:.2f},{base_pos[1]:.2f}), "
-                f"target=({target[0]:.2f},{target[1]:.2f}), dist={dist:.2f}"
+                f"target=({target[0]:.2f},{target[1]:.2f}), dist={dist:.2f}, "
+                f"cpp={'Y' if self._cpp_waypoint_active else 'N'}"
             )
 
     def _render_waypoints(self):
