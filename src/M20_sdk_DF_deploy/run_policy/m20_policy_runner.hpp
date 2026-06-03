@@ -618,9 +618,15 @@ public:
             GenerateWaypoints(waypoint_origin_yaw_);
             waypoint_idx_ = 1;
             std::cout << "[M20PolicyRunner] Waypoint origin set to ("
-                      << waypoint_origin_xy_(0) << ", " << waypoint_origin_xy_(1)
-                      << "), yaw0=" << waypoint_origin_yaw_ << std::endl;
-        }
+                    << waypoint_origin_xy_(0) << ", " << waypoint_origin_xy_(1)
+                    << "), yaw0=" << waypoint_origin_yaw_
+                    << " (base_pos_w=" << ro.base_pos_w.transpose() << ")" << std::endl;
+            // 如果 base_pos_w 全为0，说明位置源可能没有连接
+            if (ro.base_pos_w.isZero()) {
+                std::cerr << "[M20PolicyRunner] WARNING: base_pos_w is (0,0,0)! "
+                        << "Check /SLAM_ODOM or /LIO_ODOM topic is available." << std::endl;
+            }
+}
 
         const Eigen::Vector2f &local_wp = waypoints_xy_[waypoint_idx_];
         Eigen::Vector2f target_xy = LocalWaypointToWorld(local_wp);

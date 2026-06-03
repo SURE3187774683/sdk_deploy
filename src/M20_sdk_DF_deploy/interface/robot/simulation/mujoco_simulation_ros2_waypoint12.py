@@ -600,6 +600,7 @@ class MuJoCoSimulationWaypointNode(Node):
             joint.driver_temp = 45.0
         self.joints_pub.publish(joints_msg)
 
+    def _publish_base_pose(self):
         base_pose_msg = Float32MultiArray()
         base_pose_msg.data = [
             float(self.data.qpos[0]),
@@ -628,6 +629,9 @@ class MuJoCoSimulationWaypointNode(Node):
 
                 if step % 5 == 0:
                     self._publish_robot_state()
+
+                if step % 100 == 0:
+                    self._publish_base_pose()
 
                 if self.viewer and step % RENDER_INTERVAL == 0:
                     self._render_waypoints()

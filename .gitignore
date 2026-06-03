@@ -5,3 +5,5 @@ log/
 
 tmp/
 .codex
+
+src/M20_sdk_DF_deploy/traj/*
