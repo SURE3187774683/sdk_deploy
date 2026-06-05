@@ -33,7 +33,6 @@ CMD_TIMEOUT_SEC = 0.5
 
 # autopilot
 AUTO_TRACK_WAYPOINTS = True
-WAYPOINT_REACH_THRESHOLD = 0.25
 MAX_VXY = 0.8
 MAX_WZ = 1.2
 Kp_VXY = 0.9
@@ -42,18 +41,183 @@ FALLBACK_KP = 80.0
 FALLBACK_KD = 2.0
 MAX_JOINT_TORQUE_ABS = 120.0
 
-# 12个点（世界坐标系 x,y）
-WAYPOINTS_XY = np.array([
-    [0.0, -2.0],
-    [3.0, 2.0],
-    [6.0, -2.0],
-    [9.0, 2.0],
-    [12.0, -2.0],
-    [9.0, 2.0],
-    [6.0, -2.0],
-    [3.0, 2.0],
-    [0.0, -2.0],
-], dtype=np.float32)
+def _resolve_waypoint_cfg_path() -> Path:
+    env_path = os.getenv("M20_WAYPOINT_CFG")
+    if env_path:
+        p = Path(env_path).expanduser().resolve()
+        if p.is_file():
+            return p
+    return (CURRENT_DIR / ".." / ".." / ".." / ".." /
+            "M20_sdk_DF_deploy" / "config" / "waypoint_path.cfg").resolve()
+
+
+def _load_waypoint_rect_cfg() -> dict:
+    cfg_path = _resolve_waypoint_cfg_path()
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Waypoint cfg not found: {cfg_path}")
+
+    float_keys = {"r_min", "r_max", "theta_min", "theta_max",
+                  "point_move_vE_min", "point_move_vE_max", "target_z",
+                  "reach_threshold", "curve_scale", "point_spacing",
+                  "curve_num_cycles", "ellipse_b_ratio", "spiral_growth",
+                  "trochoid_d_ratio", "hypocycloid_R_ratio",
+                  "hypocycloid_d_ratio"}
+    int_keys = {"num_waypoints", "point_move_vE_cycle_min_points",
+                "point_move_vE_cycle_max_points", "obs_num_points", "seed",
+                "path_type", "rose_n", "rose_d"}
+    cfg = {}
+    with cfg_path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key in float_keys:
+                cfg[key] = float(value)
+            elif key in int_keys:
+                cfg[key] = int(value)
+
+    required = {"path_type", "reach_threshold", "point_move_vE_min",
+                "point_move_vE_max", "point_move_vE_cycle_min_points",
+                "point_move_vE_cycle_max_points", "seed"}
+    missing = sorted(required - cfg.keys())
+    if missing:
+        raise ValueError(f"Missing waypoint cfg keys: {missing}")
+    if int(cfg["path_type"]) == 0:
+        random_required = {"num_waypoints", "r_min", "r_max",
+                           "theta_min", "theta_max"}
+        missing = sorted(random_required - cfg.keys())
+        if missing:
+            raise ValueError(f"Missing random waypoint cfg keys: {missing}")
+        if cfg["num_waypoints"] < 2 or cfg["r_min"] <= 0.0 or cfg["r_max"] < cfg["r_min"]:
+            raise ValueError(f"Invalid random waypoint cfg: {cfg}")
+    return cfg
+
+
+WAYPOINT_CFG = _load_waypoint_rect_cfg()
+
+
+def _equal_arc_length_sample(curve_fn, t_start, t_end, spacing, max_points=10000):
+    n_dense = 20000
+    ts = np.linspace(t_start, t_end, n_dense + 1, dtype=np.float64)
+    dense = np.array([curve_fn(t) for t in ts], dtype=np.float32)
+
+    diffs = np.diff(dense, axis=0)
+    seg_len = np.linalg.norm(diffs, axis=1)
+    arc = np.zeros(n_dense + 1, dtype=np.float32)
+    arc[1:] = np.cumsum(seg_len)
+    total_arc = float(arc[-1])
+    if total_arc < 1e-6 or spacing < 1e-6:
+        return dense[:1].copy()
+
+    n_pts = min(max_points, int(total_arc / spacing) + 2)
+    result = [dense[0].copy()]
+    j = 0
+    for k in range(1, n_pts):
+        target = k * spacing
+        if target >= total_arc:
+            break
+        while j < n_dense - 1 and arc[j + 1] < target:
+            j += 1
+        denom = arc[j + 1] - arc[j]
+        frac = (target - arc[j]) / denom if denom > 1e-9 else 0.0
+        result.append(dense[j] + frac * (dense[j + 1] - dense[j]))
+    return np.array(result, dtype=np.float32)
+
+
+def _generate_fixed_curve_waypoints(cfg: dict, initial_heading_w: float = 0.0):
+    scale = float(cfg.get("curve_scale", 3.0))
+    spacing = float(cfg.get("point_spacing", 0.2))
+    ncycles = float(cfg.get("curve_num_cycles", 3.0))
+    path_type = int(cfg.get("path_type", 0))
+    k_pi = float(np.pi)
+    t_start, t_end = 0.0, 2.0 * k_pi
+    curve_fn = None
+
+    if path_type == 1:
+        curve_fn = lambda t: np.array([scale * np.sin(t),
+                                       scale * 0.5 * np.sin(2.0 * t)], dtype=np.float32)
+    elif path_type == 2:
+        t_end = ncycles * 2.0 * k_pi
+        curve_fn = lambda t, s=scale, p=k_pi: np.array(
+            [s * t / (2.0 * p), s * 0.3 * np.sin(t)], dtype=np.float32)
+    elif path_type == 3:
+        t_end = ncycles * 2.0 * k_pi
+        curve_fn = lambda t, s=scale: np.array(
+            [s * np.sin(t), s * (1.0 - np.cos(t))], dtype=np.float32)
+    elif path_type == 4:
+        growth = float(cfg.get("spiral_growth", 0.3))
+        t_end = ncycles * 2.0 * k_pi
+        curve_fn = lambda t, g=growth, s=scale: np.array(
+            [s * g * t * np.cos(t), s * g * t * np.sin(t)], dtype=np.float32)
+    elif path_type == 5:
+        b = scale * float(cfg.get("ellipse_b_ratio", 0.5))
+        t_end = ncycles * 2.0 * k_pi
+        curve_fn = lambda t, s=scale, b_=b: np.array(
+            [s * np.sin(t), b_ * (1.0 - np.cos(t))], dtype=np.float32)
+    elif path_type == 6:
+        n = max(1, int(cfg.get("rose_n", 3)))
+        d = max(1, int(cfg.get("rose_d", 1)))
+        nd = float(n) / float(d)
+        t_end = (2.0 * k_pi * float(d)) if (n * d) % 2 == 0 else (k_pi * float(d))
+        curve_fn = lambda t, s=scale, nd_=nd: np.array(
+            [s * np.cos(nd_ * t) * np.cos(t),
+             s * np.cos(nd_ * t) * np.sin(t)], dtype=np.float32)
+    elif path_type == 7:
+        radius = scale * 0.5
+        dist = radius * float(cfg.get("trochoid_d_ratio", 0.5))
+        t_end = ncycles * 2.0 * k_pi
+        curve_fn = lambda t, r=radius, d=dist: np.array(
+            [r * t - d * np.sin(t), r - d * np.cos(t)], dtype=np.float32)
+    elif path_type == 8:
+        radius = scale
+        k = max(2.0, float(cfg.get("hypocycloid_R_ratio", 4.0)))
+        r_in = radius / k
+        dist = r_in * float(cfg.get("hypocycloid_d_ratio", 1.0))
+        ratio = (radius - r_in) / r_in
+        curve_fn = lambda t, r=radius, ri=r_in, d=dist, ratio_=ratio: np.array(
+            [(r - ri) * np.cos(t) + d * np.cos(ratio_ * t),
+             (r - ri) * np.sin(t) - d * np.sin(ratio_ * t)], dtype=np.float32)
+    else:
+        return None, None
+
+    raw = _equal_arc_length_sample(curve_fn, t_start, t_end, spacing)
+    if len(raw) == 0:
+        return None, None
+    raw -= raw[0]
+
+    ch, sh = np.cos(initial_heading_w), np.sin(initial_heading_w)
+    rotated = np.empty_like(raw)
+    rotated[:, 0] = ch * raw[:, 0] - sh * raw[:, 1]
+    rotated[:, 1] = sh * raw[:, 0] + ch * raw[:, 1]
+
+    vmag = np.zeros(len(rotated), dtype=np.float32)
+    state = (int(cfg["seed"]) & 0xFFFFFFFF) if int(cfg["seed"]) >= 0 else (int(time.time()) & 0xFFFFFFFF)
+
+    def next_rand01():
+        nonlocal state
+        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+        return float(state) / 4294967295.0
+
+    ve_cycle_t = 2.0 * next_rand01()
+    pmin = int(cfg["point_move_vE_cycle_min_points"])
+    pmax = max(pmin, int(cfg["point_move_vE_cycle_max_points"]))
+    period = pmin + int(next_rand01() * (pmax - pmin + 1))
+    for i in range(len(rotated)):
+        vmin = float(cfg["point_move_vE_min"])
+        vmax = float(cfg["point_move_vE_max"])
+        if vmax <= vmin:
+            vmag[i] = vmin
+        else:
+            tri = ve_cycle_t if ve_cycle_t < 1.0 else 2.0 - ve_cycle_t
+            vmag[i] = vmin + tri * (vmax - vmin)
+            ve_cycle_t += 2.0 / max(1, period)
+            if ve_cycle_t >= 2.0:
+                ve_cycle_t -= 2.0
+                period = pmin + int(next_rand01() * (pmax - pmin + 1))
+    return rotated, vmag
 
 JOINT_DIR = np.array([1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1, -1], dtype=np.float32)
 POS_OFFSET_DEG = np.array([-25, 229, 160, 0, 25, -131, -200, 0, -25, -229, -160, 0, 25, 131, 200, 0], dtype=np.float32)
@@ -95,10 +259,16 @@ class MuJoCoSimulationWaypointNode(Node):
         self.last_cmd_time = -1.0
 
         self.wp_idx = 0
-        self.waypoints_xy = WAYPOINTS_XY.copy()
+        self.waypoint_origin_xy = self.data.qpos[:2].copy().astype(np.float32)
+        yaw0 = float(self.quaternion_to_euler(self.data.qpos[3:7].copy())[2])
+        self.waypoints_xy, self.waypoints_vE = self._generate_world_waypoints(self.waypoint_origin_xy, yaw0)
         self.wp_total = self.waypoints_xy.shape[0]
 
         self.get_logger().info(f"[INFO] MuJoCo model loaded, dof={self.dof_num}, waypoints={self.wp_total}")
+        self.get_logger().info(
+            f"[WP] cfg={_resolve_waypoint_cfg_path()}, "
+            f"origin=({self.waypoint_origin_xy[0]:.2f}, {self.waypoint_origin_xy[1]:.2f}), yaw0={yaw0:.3f}"
+        )
 
         self.imu_pub = self.create_publisher(ImuData, '/IMU_DATA', 200)
         self.joints_pub = self.create_publisher(JointsData, '/JOINTS_DATA', 200)
@@ -168,6 +338,58 @@ class MuJoCoSimulationWaypointNode(Node):
     def wrap_to_pi(angle):
         return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
+    def _generate_world_waypoints(self, origin_xy: np.ndarray, yaw0: float):
+        path_type = int(WAYPOINT_CFG.get("path_type", 0))
+        if path_type > 0:
+            local_xy, vmag = _generate_fixed_curve_waypoints(WAYPOINT_CFG, yaw0)
+            if local_xy is not None and len(local_xy) > 0:
+                self.get_logger().info(
+                    f"[WP] fixed curve path_type={path_type}, "
+                    f"n_pts={len(local_xy)}, spacing={WAYPOINT_CFG.get('point_spacing', 0.2):.2f}"
+                )
+                return (local_xy + origin_xy.reshape(1, 2)).astype(np.float32), vmag
+            self.get_logger().warn("[WP] fixed curve generation failed, falling back to random")
+
+        n = int(WAYPOINT_CFG["num_waypoints"])
+        local = np.zeros((n, 2), dtype=np.float32)
+        vmag = np.zeros((n,), dtype=np.float32)
+        state = (int(WAYPOINT_CFG["seed"]) & 0xFFFFFFFF) if int(WAYPOINT_CFG["seed"]) >= 0 else (int(time.time()) & 0xFFFFFFFF)
+
+        def next_rand01() -> float:
+            nonlocal state
+            state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+            return float(state) / 4294967295.0
+
+        ve_cycle_t = 2.0 * next_rand01()
+        pmin = int(WAYPOINT_CFG["point_move_vE_cycle_min_points"])
+        pmax = max(pmin, int(WAYPOINT_CFG["point_move_vE_cycle_max_points"]))
+        period = pmin + int(next_rand01() * (pmax - pmin + 1))
+        heading = float(yaw0)
+
+        def sample_ve() -> float:
+            nonlocal ve_cycle_t, period
+            vmin = float(WAYPOINT_CFG["point_move_vE_min"])
+            vmax = float(WAYPOINT_CFG["point_move_vE_max"])
+            if vmax <= vmin:
+                return vmin
+            tri = ve_cycle_t if ve_cycle_t < 1.0 else 2.0 - ve_cycle_t
+            speed = vmin + tri * (vmax - vmin)
+            ve_cycle_t += 2.0 / max(1, period)
+            if ve_cycle_t >= 2.0:
+                ve_cycle_t -= 2.0
+                period = pmin + int(next_rand01() * (pmax - pmin + 1))
+            return speed
+
+        for i in range(1, n):
+            r = float(WAYPOINT_CFG["r_min"]) + next_rand01() * (float(WAYPOINT_CFG["r_max"]) - float(WAYPOINT_CFG["r_min"]))
+            if i > 1:
+                dtheta = (float(WAYPOINT_CFG["theta_min"]) + next_rand01() * (float(WAYPOINT_CFG["theta_max"]) - float(WAYPOINT_CFG["theta_min"]))) * 2.0 * np.pi
+                heading += dtheta
+            local[i, 0] = local[i - 1, 0] + r * np.cos(heading)
+            local[i, 1] = local[i - 1, 1] + r * np.sin(heading)
+            vmag[i - 1] = sample_ve()
+        return (local + origin_xy.reshape(1, 2)).astype(np.float32), vmag
+
     def _apply_joint_torque(self):
         q = self.data.qpos[7:7 + self.dof_num].reshape(-1, 1)
         dq = self.data.qvel[6:6 + self.dof_num].reshape(-1, 1)
@@ -189,7 +411,7 @@ class MuJoCoSimulationWaypointNode(Node):
         delta = target - base_pos
         dist = float(np.linalg.norm(delta))
 
-        if dist < WAYPOINT_REACH_THRESHOLD:
+        if dist < float(WAYPOINT_CFG["reach_threshold"]):
             self.wp_idx = (self.wp_idx + 1) % self.wp_total
             target = self.waypoints_xy[self.wp_idx]
             delta = target - base_pos
@@ -199,7 +421,8 @@ class MuJoCoSimulationWaypointNode(Node):
         desired_yaw = float(np.arctan2(delta[1], delta[0]))
         yaw_err = self.wrap_to_pi(desired_yaw - yaw)
 
-        v_mag = np.clip(Kp_VXY * dist, 0.0, MAX_VXY)
+        cfg_speed = float(self.waypoints_vE[self.wp_idx]) if self.wp_idx < len(self.waypoints_vE) else MAX_VXY
+        v_mag = np.clip(Kp_VXY * dist, 0.0, min(MAX_VXY, cfg_speed))
         vx_w = v_mag * np.cos(desired_yaw)
         vy_w = v_mag * np.sin(desired_yaw)
         wz = np.clip(Kp_WZ * yaw_err, -MAX_WZ, MAX_WZ)

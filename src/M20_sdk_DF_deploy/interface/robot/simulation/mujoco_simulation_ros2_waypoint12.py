@@ -33,7 +33,6 @@ CMD_TIMEOUT_SEC = 0.5
 
 # autopilot
 AUTO_TRACK_WAYPOINTS = True
-WAYPOINT_REACH_THRESHOLD = 0.25
 MAX_VXY = 0.8
 MAX_WZ = 1.2
 Kp_VXY = 0.9
@@ -58,7 +57,7 @@ def _load_waypoint_rect_cfg() -> dict:
         raise FileNotFoundError(f"Waypoint cfg not found: {cfg_path}")
     _float_keys = {"r_min", "r_max", "theta_min", "theta_max",
                    "point_move_vE_min", "point_move_vE_max", "target_z",
-                   "curve_scale", "point_spacing", "curve_num_cycles",
+                   "reach_threshold", "curve_scale", "point_spacing", "curve_num_cycles",
                    "ellipse_b_ratio", "spiral_growth", "trochoid_d_ratio",
                    "hypocycloid_R_ratio", "hypocycloid_d_ratio"}
     _int_keys   = {"num_waypoints", "point_move_vE_cycle_min_points",
@@ -81,6 +80,8 @@ def _load_waypoint_rect_cfg() -> dict:
     if cfg.get("path_type", 0) == 0:
         if cfg.get("num_waypoints", 0) < 2 or cfg.get("r_min", 0.0) <= 0.0 or cfg.get("r_max", 0.0) < cfg.get("r_min", 0.0):
             raise ValueError(f"Invalid waypoint cfg: {cfg}")
+    if "reach_threshold" not in cfg or cfg["reach_threshold"] <= 0.0:
+        raise ValueError(f"Invalid reach_threshold in waypoint cfg: {cfg}")
     return cfg
 
 
@@ -135,7 +136,7 @@ def _generate_fixed_curve_waypoints(cfg: dict, initial_heading_w: float = 0.0):
     if path_type == 1:   # 8字形 (Figure-Eight)
         curve_fn = lambda t: np.array([scale * np.sin(t),
                                        scale * 0.5 * np.sin(2.0 * t)], dtype=np.float32)
-        t_end = 2.0 * kPi
+        t_end = ncycles * 2.0 * kPi
     elif path_type == 2: # S型 (S-Curve)
         t_end = ncycles * 2.0 * kPi
         curve_fn = lambda t, _s=scale, _p=kPi: np.array(
@@ -430,7 +431,7 @@ class MuJoCoSimulationWaypointNode(Node):
         self.input_tq = np.clip(self.input_tq, -MAX_JOINT_TORQUE_ABS, MAX_JOINT_TORQUE_ABS)
         self.data.ctrl[:] = self.input_tq.flatten()
 
-    def _autopilot_track_waypoint(self, step: int):
+    def _autopilot_track_waypoint(self, step: int, check_reach: bool):
         if not AUTO_TRACK_WAYPOINTS:
             return
 
@@ -446,7 +447,8 @@ class MuJoCoSimulationWaypointNode(Node):
 
         # When C++ waypoint data is active, do NOT advance wp_idx independently.
         # The C++ policy controls waypoint advancement via /WAYPOINT_PATH topic.
-        if not self._cpp_waypoint_active and dist < WAYPOINT_REACH_THRESHOLD:
+        if (check_reach and not self._cpp_waypoint_active and
+                dist < float(WAYPOINT_CFG["reach_threshold"])):
             self.wp_idx = (self.wp_idx + 1) % self.wp_total
             target = self.waypoints_xy[self.wp_idx]
             delta = target - base_pos
@@ -601,11 +603,16 @@ class MuJoCoSimulationWaypointNode(Node):
         self.joints_pub.publish(joints_msg)
 
     def _publish_base_pose(self):
+        q_world = self.data.qpos[3:7].copy()
+        rpy_rad = self.quaternion_to_euler(q_world)
         base_pose_msg = Float32MultiArray()
         base_pose_msg.data = [
             float(self.data.qpos[0]),
             float(self.data.qpos[1]),
             float(self.data.qpos[2]),
+            float(rpy_rad[0]),
+            float(rpy_rad[1]),
+            float(rpy_rad[2]),
         ]
         self.base_pose_pub.publish(base_pose_msg)
 
@@ -622,7 +629,8 @@ class MuJoCoSimulationWaypointNode(Node):
 
                 self._apply_fallback_stand_cmd_if_needed()
                 self._apply_joint_torque()
-                self._autopilot_track_waypoint(step)
+                publish_pose_10hz = (step % 100 == 0)
+                self._autopilot_track_waypoint(step, publish_pose_10hz)
 
                 mujoco.mj_step(self.model, self.data)
                 self.timestamp = step * DT
@@ -630,7 +638,7 @@ class MuJoCoSimulationWaypointNode(Node):
                 if step % 5 == 0:
                     self._publish_robot_state()
 
-                if step % 100 == 0:
+                if publish_pose_10hz:
                     self._publish_base_pose()
 
                 if self.viewer and step % RENDER_INTERVAL == 0:

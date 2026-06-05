@@ -96,6 +96,10 @@ private:
     bool waypoint_origin_initialized_ = false;
     Vec4f last_waypoint_cmd_ = Vec4f::Zero();
     float waypoint_reach_threshold_ = 0.05f;
+    Eigen::Vector2f last_waypoint_target_xy_ = Eigen::Vector2f::Zero();
+    Eigen::Vector2f last_waypoint_delta_w_ = Eigen::Vector2f::Zero();
+    float last_waypoint_dist_ = 0.0f;
+    bool last_waypoint_reached_ = false;
     static constexpr float raw_action_limit_ = 10.0f;
     static constexpr float wheel_vel_limit_ = 50.0f;
 
@@ -301,7 +305,7 @@ private:
                     return {scale * std::sin(t),
                             scale * 0.5f * std::sin(2.0f * t)};
                 };
-                t_end = 2.0f * kPi;
+                t_end = ncycles * 2.0f * kPi;
                 break;
             }
             // ── 2. S型 (S-Curve, sinusoidal forward motion) ───────────────────────
@@ -632,12 +636,27 @@ public:
         Eigen::Vector2f target_xy = LocalWaypointToWorld(local_wp);
         Eigen::Vector2f delta_w = target_xy - base_xy;
         float dist = delta_w.norm();
+        last_waypoint_reached_ = false;
         if (dist < waypoint_reach_threshold_) {
+            const int reached_idx = waypoint_idx_;
             waypoint_idx_ = std::min(waypoint_idx_ + 1, static_cast<int>(waypoints_xy_.size()) - 1);
+            last_waypoint_reached_ = true;
+            std::cout << "[M20PolicyRunner] waypoint reached"
+                      << " reached_wp=" << reached_idx
+                      << " next_wp=" << waypoint_idx_
+                      << " dist=" << dist
+                      << " threshold=" << waypoint_reach_threshold_
+                      << " base_xy=(" << base_xy(0) << "," << base_xy(1) << ")"
+                      << " target_xy=(" << target_xy(0) << "," << target_xy(1) << ")"
+                      << std::endl;
             const Eigen::Vector2f &local_wp_next = waypoints_xy_[waypoint_idx_];
             target_xy = LocalWaypointToWorld(local_wp_next);
             delta_w = target_xy - base_xy;
+            dist = delta_w.norm();
         }
+        last_waypoint_target_xy_ = target_xy;
+        last_waypoint_delta_w_ = delta_w;
+        last_waypoint_dist_ = dist;
 
         const float yaw = ro.base_rpy(2);
         const float cy = std::cos(yaw);
@@ -758,18 +777,25 @@ public:
             robot_action.goal_joint_vel(i*4+3) = LimitNumber(tmp_action_eigen(i*4+3), -wheel_vel_limit_, wheel_vel_limit_);
         }
 
-        // if (run_cnt_ < 20 || run_cnt_ % 50 == 0) {
-        //     std::cout << "[M20PolicyRunner] debug"
-        //               << " cnt=" << run_cnt_
-        //               << " obs_dim=" << observation_dim_
-        //               << " wp=" << waypoint_idx_
-        //               << " base_xy=(" << ro.base_pos_w(0) << "," << ro.base_pos_w(1) << ")"
-        //               << " cmd=(" << last_waypoint_cmd_.transpose() << ")"
-        //               << " joint_rel_minmax=(" << joint_pos_rl.minCoeff() << "," << joint_pos_rl.maxCoeff() << ")"
-        //               << " raw_action_minmax=(" << raw_action_eigen.minCoeff() << "," << raw_action_eigen.maxCoeff() << ")"
-        //               << " clipped_action_minmax=(" << current_action_eigen.minCoeff() << "," << current_action_eigen.maxCoeff() << ")"
-        //               << std::endl;
-        // }
+        if (run_cnt_ < 20 || run_cnt_ % 10 == 0) {
+            std::cout << "[M20PolicyRunner] debug"
+                      << " cnt=" << run_cnt_
+                      << " obs_dim=" << observation_dim_
+                      << " wp=" << waypoint_idx_
+                      << " base_xy=(" << ro.base_pos_w(0) << "," << ro.base_pos_w(1) << ")"
+                      << " target_xy=(" << last_waypoint_target_xy_(0) << "," << last_waypoint_target_xy_(1) << ")"
+                      << " delta_w=(" << last_waypoint_delta_w_(0) << "," << last_waypoint_delta_w_(1) << ")"
+                      << " dist=" << last_waypoint_dist_
+                      << " reach_th=" << waypoint_reach_threshold_
+                      << " reached=" << (last_waypoint_reached_ ? "Y" : "N")
+                      << " rpy=(" << ro.base_rpy.transpose() << ")"
+                      << " omega=(" << ro.base_omega.transpose() << ")"
+                      << " cmd=(" << last_waypoint_cmd_.transpose() << ")"
+                      << " joint_rel_minmax=(" << joint_pos_rl.minCoeff() << "," << joint_pos_rl.maxCoeff() << ")"
+                      << " raw_action_minmax=(" << raw_action_eigen.minCoeff() << "," << raw_action_eigen.maxCoeff() << ")"
+                      << " clipped_action_minmax=(" << current_action_eigen.minCoeff() << "," << current_action_eigen.maxCoeff() << ")"
+                      << std::endl;
+        }
 
         
         ++run_cnt_;

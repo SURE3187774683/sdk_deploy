@@ -21,7 +21,9 @@
 #include "drdds/msg/imu_data.hpp"
 #include "drdds/msg/battery_data.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "sensor_msgs/msg/imu.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
+#include <cstdint>
 
 using namespace dds;
 
@@ -37,6 +39,11 @@ protected:
     Vec3f omega_body_, rpy_, acc_;
     Vec3f base_pos_w_ = Vec3f::Zero();
     bool slam_odom_received_ = false;
+    bool sensor_imu_received_ = false;
+    uint64_t dds_imu_debug_cnt_ = 0;
+    uint64_t sensor_imu_debug_cnt_ = 0;
+    uint64_t slam_odom_debug_cnt_ = 0;
+    uint64_t base_pose_debug_cnt_ = 0;
     VecXf joint_pos_, joint_vel_, joint_tau_;
     VecXf motor_temperture_, driver_temperture_;
     float *pos_offset_;
@@ -56,6 +63,7 @@ protected:
     rclcpp::Publisher<drdds::msg::JointsDataCmd>::SharedPtr joint_cmd_pub_;
     rclcpp::Subscription<drdds::msg::JointsData>::SharedPtr joint_data_sub_;
     rclcpp::Subscription<drdds::msg::ImuData>::SharedPtr imu_data_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_raw_sub_;
     rclcpp::Subscription<drdds::msg::BatteryData>::SharedPtr health_data_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr slam_odom_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr base_pose_sub_;
@@ -156,6 +164,8 @@ public:
                                     std::bind(&DdsInterface::Handler, this,std::placeholders::_1));
         imu_data_sub_ = node_->create_subscription<drdds::msg::ImuData>("/IMU_DATA", 10,
                                     std::bind(&DdsInterface::HandlerIMU, this, std::placeholders::_1));
+        imu_raw_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>("/IMU", 10,
+                                    std::bind(&DdsInterface::HandlerSensorImu, this, std::placeholders::_1));
         health_data_sub_ = node_->create_subscription<drdds::msg::BatteryData>("/BATTERY_DATA", 10,
                                     std::bind(&DdsInterface::HandlerHealth, this, std::placeholders::_1));
         slam_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
@@ -305,12 +315,52 @@ public:
     }
 
     void HandlerIMU(const drdds::msg::ImuData::SharedPtr msg) {
-        if (!slam_odom_received_) {
+        if (!sensor_imu_received_ && !slam_odom_received_) {
             rpy_ = Vec3f(Deg2Rad(msg->data.roll), Deg2Rad(msg->data.pitch), Deg2Rad(msg->data.yaw));
         }
-        acc_ << msg->data.acc_x, msg->data.acc_y, msg->data.acc_z;
-        omega_body_ << msg->data.omega_x, msg->data.omega_y, msg->data.omega_z;
+        if (!sensor_imu_received_) {
+            acc_ << msg->data.acc_x, msg->data.acc_y, msg->data.acc_z;
+            omega_body_ << msg->data.omega_x, msg->data.omega_y, msg->data.omega_z;
+        }
         imu_ts_ = rclcpp::Time(msg->header.stamp).seconds();
+        ++dds_imu_debug_cnt_;
+        if (dds_imu_debug_cnt_ <= 5 || dds_imu_debug_cnt_ % 200 == 0) {
+            std::cout << "[DdsInterface] /IMU_DATA"
+                      << " cnt=" << dds_imu_debug_cnt_
+                      << " used_for_rpy=" << ((!sensor_imu_received_ && !slam_odom_received_) ? "Y" : "N")
+                      << " sensor_imu_received=" << (sensor_imu_received_ ? "Y" : "N")
+                      << " slam_odom_received=" << (slam_odom_received_ ? "Y" : "N")
+                      << " rpy=(" << rpy_.transpose() << ")"
+                      << " acc=(" << acc_.transpose() << ")"
+                      << " omega=(" << omega_body_.transpose() << ")"
+                      << std::endl;
+        }
+    }
+
+    void HandlerSensorImu(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        sensor_imu_received_ = true;
+        const auto& q = msg->orientation;
+        if (!slam_odom_received_) {
+            rpy_ = QuaternionToRpy(q.x, q.y, q.z, q.w);
+        }
+        acc_ << msg->linear_acceleration.x,
+                msg->linear_acceleration.y,
+                msg->linear_acceleration.z;
+        omega_body_ << msg->angular_velocity.x,
+                       msg->angular_velocity.y,
+                       msg->angular_velocity.z;
+        imu_ts_ = rclcpp::Time(msg->header.stamp).seconds();
+        ++sensor_imu_debug_cnt_;
+        if (sensor_imu_debug_cnt_ <= 5 || sensor_imu_debug_cnt_ % 200 == 0) {
+            std::cout << "[DdsInterface] /IMU"
+                      << " cnt=" << sensor_imu_debug_cnt_
+                      << " used_for_rpy=" << (slam_odom_received_ ? "N" : "Y")
+                      << " slam_odom_received=" << (slam_odom_received_ ? "Y" : "N")
+                      << " rpy=(" << rpy_.transpose() << ")"
+                      << " acc=(" << acc_.transpose() << ")"
+                      << " omega=(" << omega_body_.transpose() << ")"
+                      << std::endl;
+        }
     }
 
     void HandlerHealth(const drdds::msg::BatteryData::SharedPtr msg) {
@@ -323,9 +373,21 @@ public:
         base_pos_w_ << msg->pose.pose.position.x,
                        msg->pose.pose.position.y,
                        msg->pose.pose.position.z;
+        Vec3f odom_rpy = rpy_;
         const auto& q = msg->pose.pose.orientation;
-        rpy_ = QuaternionToRpy(q.x, q.y, q.z, q.w);
+        odom_rpy = QuaternionToRpy(q.x, q.y, q.z, q.w);
+        rpy_ = odom_rpy;
         slam_odom_received_ = true;
+        ++slam_odom_debug_cnt_;
+        if (slam_odom_debug_cnt_ <= 5 || slam_odom_debug_cnt_ % 100 == 0) {
+            std::cout << "[DdsInterface] /SLAM_ODOM"
+                      << " cnt=" << slam_odom_debug_cnt_
+                      << " pos=(" << base_pos_w_.transpose() << ")"
+                      << " odom_rpy=(" << odom_rpy.transpose() << ")"
+                      << " active_rpy=(" << rpy_.transpose() << ")"
+                      << " rpy_source=/SLAM_ODOM"
+                      << std::endl;
+        }
     }
 
     void HandlerBasePose(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
@@ -333,6 +395,19 @@ public:
             return;
         }
         base_pos_w_ << msg->data[0], msg->data[1], msg->data[2];
+        ++base_pose_debug_cnt_;
+        if (base_pose_debug_cnt_ <= 5 || base_pose_debug_cnt_ % 100 == 0) {
+            std::cout << "[DdsInterface] /BASE_POSE2D"
+                      << " cnt=" << base_pose_debug_cnt_
+                      << " pos=(" << base_pos_w_.transpose() << ")"
+                      << " active_rpy=(" << rpy_.transpose() << ")";
+            if (msg->data.size() >= 6) {
+                std::cout << " msg_rpy=(" << msg->data[3] << ","
+                          << msg->data[4] << "," << msg->data[5] << ")"
+                          << " msg_rpy_used=N";
+            }
+            std::cout << std::endl;
+        }
     }
 
     void PublishWaypointPath(const std::vector<float>& waypoint_data) override {

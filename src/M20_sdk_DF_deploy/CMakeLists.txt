@@ -27,6 +27,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(drdds REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
 set(THIRD_PARTY ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
@@ -61,6 +62,9 @@ set(CMAKE_INSTALL_RPATH
 file(GLOB_RECURSE STATE_MACHINE_SRC "state_machine/*.c*")
 
 add_executable(rl_deploy main.cpp ${STATE_MACHINE_SRC})
+if(BUILD_PLATFORM STREQUAL "arm")
+  target_compile_definitions(rl_deploy PRIVATE M20_BUILD_REAL)
+endif()
 
 add_library(onnxruntime SHARED IMPORTED)
 set_target_properties(onnxruntime PROPERTIES IMPORTED_LOCATION "${THIRD_PARTY}/onnxruntime//${BUILD_PLATFORM}/lib/libonnxruntime.so")
@@ -69,6 +73,7 @@ ament_target_dependencies(rl_deploy
   rclcpp
   drdds
   nav_msgs
+  sensor_msgs
   std_msgs
 )
 if(BUILD_PLATFORM STREQUAL "arm")

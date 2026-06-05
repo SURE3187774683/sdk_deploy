@@ -26,6 +26,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # 默认
 REAL_MODE=false
+REAL_FLAG=""
 OUTPUT_DIR=""
 HZ=50
 BAG_ONLY=false
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --real)
             REAL_MODE=true
+            REAL_FLAG="--real"
             shift
             ;;
         --bag-only)
@@ -56,15 +58,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 选择 Python 解释器: 优先 python3.10 (仿真Humble), 否则 python3 (真机Foxy)
+if command -v python3.10 &>/dev/null; then
+    PYTHON="python3.10"
+else
+    PYTHON="python3"
+fi
+
+# Source ROS2 环境
 if [ "$REAL_MODE" = true ]; then
     source /opt/ros/foxy/setup.bash
     source /opt/robot/scripts/setup_ros2.sh
-    source "${PROJECT_ROOT}/../../install/setup.bash"
-    PYTHON="python3"
-else
+    PYTHON="python3"  # 真机强制 python3
+fi
+if [ -f /opt/ros/humble/setup.bash ] && [ "$REAL_MODE" != true ]; then
     source /opt/ros/humble/setup.bash
+fi
+if [ -f "${PROJECT_ROOT}/../../install/setup.bash" ]; then
     source "${PROJECT_ROOT}/../../install/setup.bash"
-    PYTHON="python3.10"
 fi
 
 export ROS_DOMAIN_ID=1
@@ -82,6 +93,7 @@ fi
 
 BAG_PID=""
 CSV_PID=""
+_CLEANUP_DONE=false
 RUN_TS=$(date +%Y%m%d_%H%M%S)
 RUN_DIR="${OUTPUT_DIR}/${RUN_TS}"
 mkdir -p "${RUN_DIR}"
@@ -89,10 +101,28 @@ mkdir -p "${RUN_DIR}"
 LATEST_CSV=""
 
 cleanup() {
+    # Prevent double execution (INT trap + EXIT trap)
+    if [ "$_CLEANUP_DONE" = true ]; then
+        return
+    fi
+    _CLEANUP_DONE=true
+
     echo ""
     echo "[REC] Stopping..."
+    # Python already received SIGINT from Ctrl+C (same process group).
+    # Our Python signal handler will call save() and exit.
+    # Do NOT send kill -INT — it would trigger a second SIGINT that
+    # interrupts save() during PNG generation.
+    if [ -n "$CSV_PID" ]; then
+        # Wait up to 30s for Python to finish saving CSV+PNG
+        for i in $(seq 1 300); do
+            if ! kill -0 "$CSV_PID" 2>/dev/null; then break; fi
+            sleep 0.1
+        done
+        # Force kill if still alive
+        kill -9 "$CSV_PID" 2>/dev/null || true
+    fi
     [ -n "$BAG_PID" ] && kill "$BAG_PID" 2>/dev/null || true
-    [ -n "$CSV_PID" ] && kill "$CSV_PID" 2>/dev/null || true
     wait 2>/dev/null
     echo "[REC] Done. Files saved in ${RUN_DIR}/"
 }
@@ -108,7 +138,8 @@ if [ "$BAG_ONLY" = false ]; then
     echo "[REC] Starting CSV trajectory recorder (hz=${HZ})..."
     ${PYTHON} "${SCRIPT_DIR}/record_trajectory.py" \
         -o "${RUN_DIR}" \
-        --hz "${HZ}" &
+        --hz "${HZ}" \
+        ${REAL_FLAG} &
     CSV_PID=$!
 fi
 

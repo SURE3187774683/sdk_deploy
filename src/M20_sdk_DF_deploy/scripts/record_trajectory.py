@@ -89,10 +89,9 @@ class TrajectoryRecorderNode(Node):
             ImuData, '/IMU_DATA', self._imu_cb, 200)
 
         # ── Velocity estimation (from position deltas) ─────────────────
-        self._prev_xy = np.zeros(2, dtype=np.float64)
-        self._prev_stamp: float = 0.0
         self._actual_vx = 0.0
         self._actual_vy = 0.0
+        self._speed_ema_alpha = 0.35
 
         # ── Timer ──────────────────────────────────────────────────────
         self._timer = self.create_timer(self._record_dt, self._record_cb)
@@ -121,15 +120,13 @@ class TrajectoryRecorderNode(Node):
     def _base_pose_cb(self, msg: Float32MultiArray):
         if len(msg.data) < 2:
             return
-        self._actual_xy[0] = float(msg.data[0])
-        self._actual_xy[1] = float(msg.data[1])
-        self._pos_stamp = self.get_clock().now().nanoseconds / 1e9
+        stamp = self.get_clock().now().nanoseconds / 1e9
+        self._update_actual_pose(float(msg.data[0]), float(msg.data[1]), stamp)
         self._pos_source = "BASE_POSE2D"
 
     def _slam_cb(self, msg: Odometry):
-        self._actual_xy[0] = msg.pose.pose.position.x
-        self._actual_xy[1] = msg.pose.pose.position.y
-        self._pos_stamp = self.get_clock().now().nanoseconds / 1e9
+        stamp = self.get_clock().now().nanoseconds / 1e9
+        self._update_actual_pose(msg.pose.pose.position.x, msg.pose.pose.position.y, stamp)
         self._pos_source = "SLAM_ODOM"
         # Extract yaw from quaternion
         q = msg.pose.pose.orientation
@@ -142,21 +139,25 @@ class TrajectoryRecorderNode(Node):
         self._imu_yaw_rad = float(msg.data.yaw) * (np.pi / 180.0)
         self._imu_stamp = self.get_clock().now().nanoseconds / 1e9
 
+    def _update_actual_pose(self, x: float, y: float, stamp: float):
+        xy = np.array([x, y], dtype=np.float64)
+        if self._pos_stamp > 0.0:
+            dt = stamp - self._pos_stamp
+            if dt > 1e-6:
+                vel = (xy - self._actual_xy) / dt
+                self._actual_vx = float(
+                    self._speed_ema_alpha * vel[0] +
+                    (1.0 - self._speed_ema_alpha) * self._actual_vx)
+                self._actual_vy = float(
+                    self._speed_ema_alpha * vel[1] +
+                    (1.0 - self._speed_ema_alpha) * self._actual_vy)
+        self._actual_xy = xy
+        self._pos_stamp = stamp
+
     # ── Record ─────────────────────────────────────────────────────────
 
     def _record_cb(self):
         t_now = time.time() - self._start_time
-        stamp_now = self.get_clock().now().nanoseconds / 1e9
-
-        # Estimate actual velocity from position delta
-        dt_pos = stamp_now - self._prev_stamp
-        if dt_pos > 1e-6 and self._prev_stamp > 0.0:
-            dx = self._actual_xy[0] - self._prev_xy[0]
-            dy = self._actual_xy[1] - self._prev_xy[1]
-            self._actual_vx = dx / dt_pos
-            self._actual_vy = dy / dt_pos
-        self._prev_xy = self._actual_xy.copy()
-        self._prev_stamp = stamp_now
 
         actual_speed = float(np.hypot(self._actual_vx, self._actual_vy))
 
