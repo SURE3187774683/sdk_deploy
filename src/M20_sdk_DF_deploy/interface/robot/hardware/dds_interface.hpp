@@ -12,6 +12,7 @@
 #pragma once
 
 
+#include <algorithm>
 #include "common_types.h"
 #include "robot_interface.h"
 #include "dds_types.h"
@@ -20,9 +21,13 @@
 #include "drdds/msg/joints_data_cmd.hpp"
 #include "drdds/msg/imu_data.hpp"
 #include "drdds/msg/battery_data.hpp"
+#include "geometry_msgs/msg/pose_array.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 #include <cstdint>
 
 using namespace dds;
@@ -68,6 +73,9 @@ protected:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr slam_odom_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr base_pose_sub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr waypoint_path_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr waypoint_path_viz_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr waypoint_pose_array_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr waypoint_marker_pub_;
 
 
     bool IsDataUpdatedFinished() {
@@ -176,6 +184,12 @@ public:
                                     std::bind(&DdsInterface::HandlerBasePose, this, std::placeholders::_1));
         waypoint_path_pub_ = node_->create_publisher<std_msgs::msg::Float32MultiArray>(
                                     "/WAYPOINT_PATH", 10);
+        waypoint_path_viz_pub_ = node_->create_publisher<nav_msgs::msg::Path>(
+                                    "/WAYPOINT_PATH/path", 10);
+        waypoint_pose_array_pub_ = node_->create_publisher<geometry_msgs::msg::PoseArray>(
+                                    "/WAYPOINT_PATH/poses", 10);
+        waypoint_marker_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+                                    "/WAYPOINT_PATH/markers", 10);
         
         sleep(1);
 
@@ -415,5 +429,90 @@ public:
         auto msg = std_msgs::msg::Float32MultiArray();
         msg.data = waypoint_data;
         waypoint_path_pub_->publish(msg);
+        PublishWaypointPathVisualization(waypoint_data);
+    }
+
+    void PublishWaypointPathVisualization(const std::vector<float>& waypoint_data) {
+        if (waypoint_data.size() < 2) return;
+        const int wp_idx = static_cast<int>(waypoint_data[0]);
+        const int n = static_cast<int>(waypoint_data[1]);
+        if (n <= 0 || waypoint_data.size() < 2 + static_cast<size_t>(3 * n)) return;
+
+        auto stamp = node_->now();
+        auto path = nav_msgs::msg::Path();
+        path.header.stamp = stamp;
+        path.header.frame_id = "map";
+        path.poses.reserve(static_cast<size_t>(n));
+        auto poses = geometry_msgs::msg::PoseArray();
+        poses.header = path.header;
+        poses.poses.reserve(static_cast<size_t>(n));
+
+        for (int i = 0; i < n; ++i) {
+            geometry_msgs::msg::PoseStamped pose;
+            pose.header = path.header;
+            pose.pose.position.x = waypoint_data[2 + 2 * i];
+            pose.pose.position.y = waypoint_data[2 + 2 * i + 1];
+            pose.pose.position.z = 0.05;
+            pose.pose.orientation.w = 1.0;
+            poses.poses.push_back(pose.pose);
+            path.poses.push_back(pose);
+        }
+        waypoint_path_viz_pub_->publish(path);
+        waypoint_pose_array_pub_->publish(poses);
+
+        auto markers = visualization_msgs::msg::MarkerArray();
+        auto line = visualization_msgs::msg::Marker();
+        line.header = path.header;
+        line.ns = "waypoint_path";
+        line.id = 0;
+        line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        line.action = visualization_msgs::msg::Marker::ADD;
+        line.pose.orientation.w = 1.0;
+        line.scale.x = 0.04;
+        line.color.g = 0.85;
+        line.color.b = 0.25;
+        line.color.a = 0.9;
+
+        auto points = visualization_msgs::msg::Marker();
+        points.header = path.header;
+        points.ns = "waypoint_path";
+        points.id = 1;
+        points.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+        points.action = visualization_msgs::msg::Marker::ADD;
+        points.pose.orientation.w = 1.0;
+        points.scale.x = 0.12;
+        points.scale.y = 0.12;
+        points.scale.z = 0.12;
+        points.color.r = 0.1;
+        points.color.g = 0.45;
+        points.color.b = 1.0;
+        points.color.a = 0.85;
+
+        for (const auto& pose : path.poses) {
+            line.points.push_back(pose.pose.position);
+            points.points.push_back(pose.pose.position);
+        }
+
+        auto current = visualization_msgs::msg::Marker();
+        current.header = path.header;
+        current.ns = "waypoint_path";
+        current.id = 2;
+        current.type = visualization_msgs::msg::Marker::SPHERE;
+        current.action = visualization_msgs::msg::Marker::ADD;
+        current.pose.orientation.w = 1.0;
+        current.scale.x = 0.25;
+        current.scale.y = 0.25;
+        current.scale.z = 0.25;
+        current.color.r = 1.0;
+        current.color.g = 0.15;
+        current.color.b = 0.05;
+        current.color.a = 1.0;
+        const int clamped_idx = std::max(0, std::min(wp_idx, n - 1));
+        current.pose.position = path.poses[static_cast<size_t>(clamped_idx)].pose.position;
+
+        markers.markers.push_back(line);
+        markers.markers.push_back(points);
+        markers.markers.push_back(current);
+        waypoint_marker_pub_->publish(markers);
     }
 };
