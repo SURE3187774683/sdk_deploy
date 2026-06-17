@@ -86,7 +86,6 @@ colcon build --packages-up-to m20_sdk_DF_deploy --cmake-args -DBUILD_PLATFORM=x8
 # Run (Open 2 terminals)
 # Terminal 1
 export ROS_DOMAIN_ID=1
-export M20_DEPLOY_MODE=mujoco
 source install/setup.bash
 ros2 run m20_sdk_DF_deploy rl_deploy
 
@@ -136,7 +135,6 @@ source /opt/robot/scripts/setup_ros2.sh
 # Use the gamepad to enable SDK mode. Need authorization code, please contact technical support team.
 
 # Run
-export M20_DEPLOY_MODE=real
 source install/setup.bash
 ros2 run m20_sdk_DF_deploy rl_deploy
 

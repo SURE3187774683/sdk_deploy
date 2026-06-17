@@ -17,6 +17,5 @@ source /opt/robot/scripts/setup_ros2.sh
 # Use the gamepad to enable SDK mode. Need authorization code, please contact technical support team.
 
 # Run
-export M20_DEPLOY_MODE=real
 source install/setup.bash
 ros2 run m20_sdk_DF_deploy rl_deploy

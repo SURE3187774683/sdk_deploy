@@ -100,6 +100,7 @@ private:
     Eigen::Vector2f last_waypoint_delta_w_ = Eigen::Vector2f::Zero();
     float last_waypoint_dist_ = 0.0f;
     bool last_waypoint_reached_ = false;
+    bool waypoint_finished_ = false;
     static constexpr float raw_action_limit_ = 10.0f;
     static constexpr float wheel_vel_limit_ = 50.0f;
 
@@ -587,6 +588,7 @@ public:
             waypoint_idx_ = 1;
             std::cout << "[M20PolicyRunner] Start waypoint tracking from point #1" << std::endl;
         }
+        waypoint_finished_ = false;
         waypoint_origin_initialized_ = false;
         waypoint_origin_xy_.setZero();
         waypoint_origin_yaw_ = 0.0f;
@@ -637,18 +639,24 @@ public:
         Eigen::Vector2f delta_w = target_xy - base_xy;
         float dist = delta_w.norm();
         last_waypoint_reached_ = false;
-        if (dist < waypoint_reach_threshold_) {
+        if (!waypoint_finished_ && dist < waypoint_reach_threshold_) {
             const int reached_idx = waypoint_idx_;
-            waypoint_idx_ = std::min(waypoint_idx_ + 1, static_cast<int>(waypoints_xy_.size()) - 1);
+            const int last_idx = static_cast<int>(waypoints_xy_.size()) - 1;
+            waypoint_finished_ = (waypoint_idx_ >= last_idx);
+            waypoint_idx_ = std::min(waypoint_idx_ + 1, last_idx);
             last_waypoint_reached_ = true;
             std::cout << "[M20PolicyRunner] waypoint reached"
                       << " reached_wp=" << reached_idx
                       << " next_wp=" << waypoint_idx_
+                      << " finished=" << (waypoint_finished_ ? "Y" : "N")
                       << " dist=" << dist
                       << " threshold=" << waypoint_reach_threshold_
                       << " base_xy=(" << base_xy(0) << "," << base_xy(1) << ")"
                       << " target_xy=(" << target_xy(0) << "," << target_xy(1) << ")"
                       << std::endl;
+            if (waypoint_finished_) {
+                return Vec4f::Zero();
+            }
             const Eigen::Vector2f &local_wp_next = waypoints_xy_[waypoint_idx_];
             target_xy = LocalWaypointToWorld(local_wp_next);
             delta_w = target_xy - base_xy;
@@ -817,6 +825,8 @@ public:
 
     // ── Waypoint data access for ROS2 publishing ─────────────────────────
     bool IsWaypointOriginInitialized() const { return waypoint_origin_initialized_; }
+
+    bool IsWaypointFinished() const { return waypoint_finished_; }
 
     int GetWaypointIdx() const { return waypoint_idx_; }
 
