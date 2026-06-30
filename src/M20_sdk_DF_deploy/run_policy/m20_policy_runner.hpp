@@ -645,15 +645,15 @@ public:
             waypoint_finished_ = (waypoint_idx_ >= last_idx);
             waypoint_idx_ = std::min(waypoint_idx_ + 1, last_idx);
             last_waypoint_reached_ = true;
-            std::cout << "[M20PolicyRunner] waypoint reached"
-                      << " reached_wp=" << reached_idx
-                      << " next_wp=" << waypoint_idx_
-                      << " finished=" << (waypoint_finished_ ? "Y" : "N")
-                      << " dist=" << dist
-                      << " threshold=" << waypoint_reach_threshold_
-                      << " base_xy=(" << base_xy(0) << "," << base_xy(1) << ")"
-                      << " target_xy=(" << target_xy(0) << "," << target_xy(1) << ")"
-                      << std::endl;
+            // std::cout << "[M20PolicyRunner] waypoint reached"
+            //           << " reached_wp=" << reached_idx
+            //           << " next_wp=" << waypoint_idx_
+            //           << " finished=" << (waypoint_finished_ ? "Y" : "N")
+            //           << " dist=" << dist
+            //           << " threshold=" << waypoint_reach_threshold_
+            //           << " base_xy=(" << base_xy(0) << "," << base_xy(1) << ")"
+            //           << " target_xy=(" << target_xy(0) << "," << target_xy(1) << ")"
+            //           << std::endl;
             if (waypoint_finished_) {
                 return Vec4f::Zero();
             }
@@ -800,6 +800,13 @@ public:
                       << " omega=(" << ro.base_omega.transpose() << ")"
                       << " cmd=(" << last_waypoint_cmd_.transpose() << ")"
                       << " joint_rel_minmax=(" << joint_pos_rl.minCoeff() << "," << joint_pos_rl.maxCoeff() << ")"
+                      << " knee_pos=(" << ro.joint_pos(2) << "," << ro.joint_pos(6)
+                      << "," << ro.joint_pos(10) << "," << ro.joint_pos(14) << ")"
+                      << " knee_rel=(" << joint_pos_rl(2) << "," << joint_pos_rl(5)
+                      << "," << joint_pos_rl(8) << "," << joint_pos_rl(11) << ")"
+                      << " knee_cmd=(" << robot_action.goal_joint_pos(2) << ","
+                      << robot_action.goal_joint_pos(6) << "," << robot_action.goal_joint_pos(10)
+                      << "," << robot_action.goal_joint_pos(14) << ")"
                       << " raw_action_minmax=(" << raw_action_eigen.minCoeff() << "," << raw_action_eigen.maxCoeff() << ")"
                       << " clipped_action_minmax=(" << current_action_eigen.minCoeff() << "," << current_action_eigen.maxCoeff() << ")"
                       << std::endl;

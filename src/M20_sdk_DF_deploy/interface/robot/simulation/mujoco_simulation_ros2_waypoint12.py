@@ -30,6 +30,11 @@ USE_VIEWER = True
 DT = 0.001
 RENDER_INTERVAL = 50
 CMD_TIMEOUT_SEC = 0.5
+WAYPOINT_PUBLISH_HZ = 50.0
+WAYPOINT_PUBLISH_INTERVAL_STEPS = max(1, int(round(1.0 / (WAYPOINT_PUBLISH_HZ * DT))))
+
+# Fixed base height reference (mirrors C++ base_height_ref_ in dds_interface.hpp)
+BASE_HEIGHT_REF = 0.55
 
 # autopilot
 AUTO_TRACK_WAYPOINTS = True
@@ -274,11 +279,13 @@ class MuJoCoSimulationWaypointNode(Node):
         self.imu_pub = self.create_publisher(ImuData, '/IMU_DATA', 200)
         self.joints_pub = self.create_publisher(JointsData, '/JOINTS_DATA', 200)
         self.base_pose_pub = self.create_publisher(Float32MultiArray, '/BASE_POSE2D', 200)
+        self.waypoint_path_pub = self.create_publisher(Float32MultiArray, '/WAYPOINT_PATH', 10)
 
         self.cmd_sub = self.create_subscription(JointsDataCmd, '/JOINTS_CMD', self._cmd_callback, 50)
 
         # Subscribe to C++ policy's waypoint path for visualization/autopilot sync
         self._cpp_waypoint_active = False
+        self._last_local_waypoint_payload = None
         self._cpp_wp_sub = self.create_subscription(Float32MultiArray, '/WAYPOINT_PATH', self._waypoint_path_callback, 10)
 
         self.viewer = mujoco.viewer.launch_passive(self.model, self.data) if USE_VIEWER else None
@@ -317,6 +324,8 @@ class MuJoCoSimulationWaypointNode(Node):
         d = msg.data
         if len(d) < 2:
             return
+        if self._is_local_waypoint_echo(d):
+            return
         wp_idx = int(d[0])
         N = int(d[1])
         if N <= 0 or len(d) < 2 + 3 * N:
@@ -330,6 +339,27 @@ class MuJoCoSimulationWaypointNode(Node):
         if not self._cpp_waypoint_active:
             self._cpp_waypoint_active = True
             self.get_logger().info(f"[WP] C++ waypoint path active: {N} points, idx={wp_idx}")
+
+    def _is_local_waypoint_echo(self, data) -> bool:
+        payload = self._last_local_waypoint_payload
+        if payload is None or len(payload) != len(data):
+            return False
+        return np.allclose(np.asarray(data, dtype=np.float32), payload, atol=1e-6)
+
+    def _publish_waypoint_path(self):
+        if self.wp_total <= 0:
+            return
+
+        msg = Float32MultiArray()
+        wp_idx = int(np.clip(self.wp_idx, 0, self.wp_total - 1))
+        payload = np.concatenate((
+            np.array([wp_idx, self.wp_total], dtype=np.float32),
+            self.waypoints_xy.reshape(-1).astype(np.float32),
+            self.waypoints_vE.astype(np.float32),
+        ))
+        self._last_local_waypoint_payload = payload
+        msg.data = payload.tolist()
+        self.waypoint_path_pub.publish(msg)
 
     def _apply_fallback_stand_cmd_if_needed(self):
         if self.last_cmd_time >= 0.0 and (self.timestamp - self.last_cmd_time) < CMD_TIMEOUT_SEC:
@@ -609,11 +639,12 @@ class MuJoCoSimulationWaypointNode(Node):
         base_pose_msg.data = [
             float(self.data.qpos[0]),
             float(self.data.qpos[1]),
-            float(self.data.qpos[2]),
+            BASE_HEIGHT_REF,
             float(rpy_rad[0]),
             float(rpy_rad[1]),
             float(rpy_rad[2]),
         ]
+        # print("float(self.data.qpos_z)", float(self.data.qpos[2]))
         self.base_pose_pub.publish(base_pose_msg)
 
     def start(self):
@@ -640,6 +671,9 @@ class MuJoCoSimulationWaypointNode(Node):
 
                 if publish_pose_10hz:
                     self._publish_base_pose()
+
+                if not self._cpp_waypoint_active and step % WAYPOINT_PUBLISH_INTERVAL_STEPS == 0:
+                    self._publish_waypoint_path()
 
                 if self.viewer and step % RENDER_INTERVAL == 0:
                     self._render_waypoints()

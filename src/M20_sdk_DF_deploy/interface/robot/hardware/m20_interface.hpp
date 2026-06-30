@@ -50,16 +50,21 @@ protected:
             joint_config_[i].dir = joint_dir_[i];
             joint_config_[i].offset = Deg2Rad(pos_offset_[i]);
         }
+        std::cout << "[M20Interface] final joint dir/offset(deg):";
+        for (int i = 0; i < dof_num_; ++i) {
+            std::cout << " " << i << "=(" << joint_dir_[i] << "," << pos_offset_[i] << ")";
+        }
+        std::cout << std::endl;
     }
 
 public:
     M20Interface(const std::string &robot_name) : DdsInterface(robot_name, 16) {
         battery_data_.resize(2 * BATTERY_DATA_SIZE);
 
-        float init_pos_offset[16] = {-25, -131, 160, 0.,
-                                     25, -131, 160, 0,
-                                     -25, 131, -160, 0,
-                                     25, 131, -160, 0};
+        float init_pos_offset[16] = {-25, 229, 160, 0.,
+                                     25, -131, -200, 0,
+                                     -25, -229, -160, 0,
+                                     25, 131, 200, 0};
         float joint_dir[16] = {1, 1, -1, 1,
                                1, -1, 1, -1,
                                -1, 1, -1, 1.,

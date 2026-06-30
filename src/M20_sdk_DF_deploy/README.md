@@ -122,8 +122,10 @@ This process is almost identical to simulation-simulation. You only need to add 
 # scp to transfer files to quadruped (open a terminal on your local computer) password is ' (a single quote)
 scp -r ~/sdk_deploy/src user@10.21.31.103:~/sdk_deploy
 
+scp -r /home/sure/workspace/sim_ws/sdk_deploy/src/M20_sdk_DF_deploy user@10.21.41.1:~/sdk_deploy/src
+
 # ssh connect for remote development, 
-ssh user@10.21.31.103
+ssh user@10.21.41.1
 cd sdk_deploy
 source /opt/ros/foxy/setup.bash #source ROS2 env
 colcon build --packages-select m20_sdk_DF_deploy --cmake-args -DBUILD_PLATFORM=arm
