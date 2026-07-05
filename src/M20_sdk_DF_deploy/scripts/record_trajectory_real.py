@@ -3,7 +3,7 @@ record_trajectory_real.py - 记录真机期望轨迹与真实轨迹对比数据
 
 订阅 ROS2 话题:
   /WAYPOINT_PATH   Float32MultiArray  期望航点 [wp_idx, N, x0,y0,..., vE0,vE1,...]
-  /SLAM_ODOM       Odometry           真机 SLAM 位姿与 twist
+  /SLAM_ODOM       Odometry           真机 SLAM 位姿 (仅用 pose, 速度由位置差分计算)
   /IMU_DATA        ImuData            真实 IMU 姿态 (yaw 备选)
 
 输出文件:
@@ -14,8 +14,8 @@ record_trajectory_real.py - 记录真机期望轨迹与真实轨迹对比数据
   pos_error_over_time_<timestamp>.png
 
 特性:
-  1. 优先使用 /SLAM_ODOM.twist.twist.linear.{x,y} 采集线速度
-  2. 对 twist 速度做有限值检查、限幅、死区与 EMA 滤波
+  1. 使用位置差分计算线速度 (Δposition / Δtime + EMA 滤波)
+  2. 对差分速度做有限值检查、限幅、死区
   3. 连续采样 CSV 增量写盘，异常退出时也尽量保留已录数据
   4. save() 幂等并带异常保护，避免图片生成失败影响 CSV 保存
 """
@@ -111,8 +111,6 @@ class TrajectoryRecorderRealNode(Node):
 
         self._actual_vx = 0.0
         self._actual_vy = 0.0
-        self._twist_vx_raw = 0.0
-        self._twist_vy_raw = 0.0
         self._vel_source = "none"
         self._speed_ema_alpha = 0.35
         self._speed_deadband = 0.02
@@ -149,7 +147,6 @@ class TrajectoryRecorderRealNode(Node):
     def _slam_cb(self, msg: Odometry):
         stamp = self.get_clock().now().nanoseconds / 1e9
         self._update_actual_pose(msg.pose.pose.position.x, msg.pose.pose.position.y, stamp)
-        self._update_twist_velocity(msg)
         self._pos_source = "SLAM_ODOM"
 
         q = msg.pose.pose.orientation
@@ -162,44 +159,32 @@ class TrajectoryRecorderRealNode(Node):
 
     def _update_actual_pose(self, x: float, y: float, stamp: float):
         xy = np.array([x, y], dtype=np.float64)
-        if self._pos_stamp > 0.0 and self._vel_source != "twist":
+        if self._pos_stamp > 0.0:
             dt = stamp - self._pos_stamp
             if dt > 1e-6:
                 vel = (xy - self._actual_xy) / dt
-                self._actual_vx = float(
-                    self._speed_ema_alpha * vel[0]
-                    + (1.0 - self._speed_ema_alpha) * self._actual_vx
-                )
-                self._actual_vy = float(
-                    self._speed_ema_alpha * vel[1]
-                    + (1.0 - self._speed_ema_alpha) * self._actual_vy
-                )
-                self._vel_source = "position_delta"
+                vx = float(vel[0])
+                vy = float(vel[1])
+                if not np.isfinite(vx) or not np.isfinite(vy):
+                    pass
+                else:
+                    vx = float(np.clip(vx, -self._speed_limit, self._speed_limit))
+                    vy = float(np.clip(vy, -self._speed_limit, self._speed_limit))
+                    if abs(vx) < self._speed_deadband:
+                        vx = 0.0
+                    if abs(vy) < self._speed_deadband:
+                        vy = 0.0
+                    self._actual_vx = float(
+                        self._speed_ema_alpha * vx
+                        + (1.0 - self._speed_ema_alpha) * self._actual_vx
+                    )
+                    self._actual_vy = float(
+                        self._speed_ema_alpha * vy
+                        + (1.0 - self._speed_ema_alpha) * self._actual_vy
+                    )
+                    self._vel_source = "position_delta"
         self._actual_xy = xy
         self._pos_stamp = stamp
-
-    def _update_twist_velocity(self, msg: Odometry):
-        vx = float(msg.twist.twist.linear.x)
-        vy = float(msg.twist.twist.linear.y)
-        if not np.isfinite(vx) or not np.isfinite(vy):
-            return
-
-        vx = float(np.clip(vx, -self._speed_limit, self._speed_limit))
-        vy = float(np.clip(vy, -self._speed_limit, self._speed_limit))
-        if abs(vx) < self._speed_deadband:
-            vx = 0.0
-        if abs(vy) < self._speed_deadband:
-            vy = 0.0
-
-        self._twist_vx_raw = vx
-        self._twist_vy_raw = vy
-        self._actual_vx = float(
-            self._speed_ema_alpha * vx + (1.0 - self._speed_ema_alpha) * self._actual_vx
-        )
-        self._actual_vy = float(
-            self._speed_ema_alpha * vy + (1.0 - self._speed_ema_alpha) * self._actual_vy
-        )
-        self._vel_source = "twist"
 
     def _record_cb(self):
         t_now = time.time() - self._start_time
