@@ -38,6 +38,7 @@ try:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 
     _HAS_MPL = True
 except ImportError:
@@ -475,22 +476,105 @@ class TrajectoryRecorderRealNode(Node):
             else traj["position_error"]
         )
 
-        fig3, ax3 = plt.subplots(figsize=(12, 5))
+        fig3, ax3 = plt.subplots(figsize=(18, 8))
+        pos_err_stats = {
+            "mean": float(np.mean(nearest_dists)),
+            "median": float(np.median(nearest_dists)),
+            "p95": float(np.percentile(nearest_dists, 95)),
+            "max": float(np.max(nearest_dists)),
+            "final": float(nearest_dists[-1]),
+        }
+        dt = float(np.median(np.diff(traj["time"]))) if len(traj["time"]) > 2 else self._record_dt
+        rolling_window = max(1, int(round(1.0 / max(dt, 1e-6))))
+        rolling_kernel = np.ones(rolling_window, dtype=np.float64) / rolling_window
+        rolling_error = np.convolve(nearest_dists, rolling_kernel, mode="same")
+        max_idx = int(np.argmax(nearest_dists))
+
         ax3.plot(
             traj["time"],
             nearest_dists,
             "-",
             color="orangered",
             linewidth=0.8,
-            alpha=0.8,
-            label="Dist to nearest trajectory point",
+            alpha=0.45,
+            label="Raw error",
+        )
+        ax3.plot(
+            traj["time"],
+            rolling_error,
+            "-",
+            color="black",
+            linewidth=2.0,
+            alpha=0.9,
+            label=f"Rolling mean (~1s, n={rolling_window})",
+        )
+        ax3.axhline(
+            pos_err_stats["mean"],
+            color="royalblue",
+            linestyle="--",
+            linewidth=1.4,
+            label=f"Mean {pos_err_stats['mean']:.3f} m",
+        )
+        ax3.axhline(
+            pos_err_stats["p95"],
+            color="purple",
+            linestyle=":",
+            linewidth=1.6,
+            label=f"P95 {pos_err_stats['p95']:.3f} m",
+        )
+        ax3.scatter(
+            [traj["time"][max_idx]],
+            [nearest_dists[max_idx]],
+            color="red",
+            s=60,
+            zorder=5,
+        )
+        ax3.annotate(
+            f"Max {pos_err_stats['max']:.3f} m\nat {traj['time'][max_idx]:.2f}s",
+            xy=(traj["time"][max_idx], nearest_dists[max_idx]),
+            xytext=(16, 24),
+            textcoords="offset points",
+            fontsize=12,
+            arrowprops={"arrowstyle": "->", "lw": 1.1, "color": "red"},
+            bbox={"boxstyle": "round,pad=0.35", "fc": "white", "ec": "red", "alpha": 0.9},
+        )
+        stats_text = "\n".join(
+            [
+                f"Samples: {len(nearest_dists)}",
+                f"Mean:   {pos_err_stats['mean']:.3f} m",
+                f"Median: {pos_err_stats['median']:.3f} m",
+                f"P95:    {pos_err_stats['p95']:.3f} m",
+                f"Max:    {pos_err_stats['max']:.3f} m",
+                f"Final:  {pos_err_stats['final']:.3f} m",
+            ]
+        )
+        ax3.text(
+            0.985,
+            0.965,
+            stats_text,
+            transform=ax3.transAxes,
+            ha="right",
+            va="top",
+            fontsize=12,
+            bbox={"boxstyle": "round,pad=0.55", "fc": "white", "ec": "0.35", "alpha": 0.93},
         )
         ax3.set_xlabel("Time (s)")
-        ax3.set_ylabel("Position Error (m)")
+        ax3.set_ylabel("Distance to nearest trajectory point (m)")
         ax3.set_title("Position Error Over Time")
-        ax3.legend(fontsize=8)
+        ax3.yaxis.set_major_locator(MaxNLocator(nbins=9))
+        ax3.yaxis.set_major_formatter(FormatStrFormatter("%.3f"))
+        ax3.xaxis.set_major_locator(MaxNLocator(nbins=12))
+        ax3.legend(loc="upper left", fontsize=10, framealpha=0.95)
         ax3.grid(True, alpha=0.3)
         fig3.tight_layout()
+
+        stats_path = run_dir / f"pos_error_stats_{ts_str}.csv"
+        with stats_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["metric", "value_m"])
+            for key in ["mean", "median", "p95", "max", "final"]:
+                writer.writerow([key, f"{pos_err_stats[key]:.6f}"])
+        self.get_logger().info(f"[REC] Saved {stats_path}")
 
         plot_paths = [
             run_dir / f"trajectory_top_view_{ts_str}.png",

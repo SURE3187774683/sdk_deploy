@@ -64,10 +64,13 @@ def _load_waypoint_rect_cfg() -> dict:
                    "point_move_vE_min", "point_move_vE_max", "target_z",
                    "reach_threshold", "curve_scale", "point_spacing", "curve_num_cycles",
                    "ellipse_b_ratio", "spiral_growth", "trochoid_d_ratio",
-                   "hypocycloid_R_ratio", "hypocycloid_d_ratio"}
+                   "hypocycloid_R_ratio", "hypocycloid_d_ratio",
+                   "future_point_update_hz", "future_point_change_scale",
+                   "spin_radius", "spin_num_turns", "spin_point_spacing", "spin_update_hz"}
     _int_keys   = {"num_waypoints", "point_move_vE_cycle_min_points",
                    "point_move_vE_cycle_max_points", "seed",
                    "path_type", "rose_n", "rose_d"}
+    _bool_keys = {"future_point_update_enable", "spin_clockwise"}
     cfg: dict = {}
     with cfg_path.open("r", encoding="utf-8") as f:
         for raw in f:
@@ -81,6 +84,8 @@ def _load_waypoint_rect_cfg() -> dict:
                 cfg[k] = float(v)
             elif k in _int_keys:
                 cfg[k] = int(v)
+            elif k in _bool_keys:
+                cfg[k] = v.lower() in ("1", "true", "yes", "on")
     # Validate: random mode needs r_min/r_max; fixed-curve mode is less strict
     if cfg.get("path_type", 0) == 0:
         if cfg.get("num_waypoints", 0) < 2 or cfg.get("r_min", 0.0) <= 0.0 or cfg.get("r_max", 0.0) < cfg.get("r_min", 0.0):
@@ -184,10 +189,23 @@ def _generate_fixed_curve_waypoints(cfg: dict, initial_heading_w: float = 0.0):
         curve_fn = lambda t, _R=R, _r=r_in, _D=D, _ratio=ratio: np.array(
             [(_R - _r) * np.cos(t) + _D * np.cos(_ratio * t),
              (_R - _r) * np.sin(t) - _D * np.sin(_ratio * t)], dtype=np.float32)
+    elif path_type == 9: # 原地转圈展示 (Spin-in-place target ring)
+        radius = max(0.02, float(cfg.get("spin_radius", 0.25)))
+        spin_spacing = max(0.005, float(cfg.get("spin_point_spacing", 0.03)))
+        turns = max(0.25, float(cfg.get("spin_num_turns", 3.0)))
+        direction = -1.0 if bool(cfg.get("spin_clockwise", False)) else 1.0
+        total_angle = turns * 2.0 * kPi
+        n_pts = max(4, int(np.ceil(radius * total_angle / spin_spacing)) + 1)
+        angles = direction * np.linspace(0.0, total_angle, n_pts, dtype=np.float32)
+        raw = np.zeros((n_pts + 1, 2), dtype=np.float32)
+        raw[1:, 0] = radius * np.cos(angles)
+        raw[1:, 1] = radius * np.sin(angles)
+        curve_fn = None
     else:
         return None, None
 
-    raw = _equal_arc_length_sample(curve_fn, t_start, t_end, spacing)
+    if curve_fn is not None:
+        raw = _equal_arc_length_sample(curve_fn, t_start, t_end, spacing)
     if len(raw) == 0:
         return None, None
 
@@ -266,15 +284,38 @@ class MuJoCoSimulationWaypointNode(Node):
         self.last_cmd_time = -1.0
 
         self.wp_idx = 0
+        self.waypoint_finished = False
         self.waypoint_origin_xy = self.data.qpos[:2].copy().astype(np.float32)
         yaw0 = float(self.quaternion_to_euler(self.data.qpos[3:7].copy())[2])
         self.waypoints_xy, self.waypoints_vE = self._generate_world_waypoints(self.waypoint_origin_xy, yaw0)
         self.wp_total = self.waypoints_xy.shape[0]
+        self._future_point_update_counter = 0
+        self._future_point_update_interval_steps = (
+            max(1, int(round(1.0 / (float(WAYPOINT_CFG.get("future_point_update_hz", 10.0)) * DT))))
+            if float(WAYPOINT_CFG.get("future_point_update_hz", 10.0)) > 0.0 else 0
+        )
+        self._spin_update_counter = 0
+        self._spin_update_interval_steps = (
+            max(1, int(round(1.0 / (float(WAYPOINT_CFG.get("spin_update_hz", 12.0)) * DT))))
+            if float(WAYPOINT_CFG.get("spin_update_hz", 12.0)) > 0.0 else 0
+        )
+        seed = int(WAYPOINT_CFG.get("seed", 42))
+        self._future_point_rng_state = ((seed if seed >= 0 else int(time.time())) ^ 0x9E3779B9) & 0xFFFFFFFF
 
         self.get_logger().info(f"[INFO] MuJoCo model loaded, dof={self.dof_num}, waypoints={self.wp_total}")
         self.get_logger().info(
             f"[WP] origin=({self.waypoint_origin_xy[0]:.2f}, {self.waypoint_origin_xy[1]:.2f}), yaw0={yaw0:.3f}"
         )
+        self.get_logger().info(
+            f"[WP] future_update={bool(WAYPOINT_CFG.get('future_point_update_enable', True))}, "
+            f"hz={float(WAYPOINT_CFG.get('future_point_update_hz', 10.0)):.1f}, "
+            f"scale={float(WAYPOINT_CFG.get('future_point_change_scale', 0.0)):.3f}"
+        )
+        if int(WAYPOINT_CFG.get("path_type", 0)) == 9:
+            self.get_logger().info(
+                f"[WP] spin_update_hz={float(WAYPOINT_CFG.get('spin_update_hz', 12.0)):.1f}, "
+                f"radius={float(WAYPOINT_CFG.get('spin_radius', 0.25)):.2f}"
+            )
 
         self.imu_pub = self.create_publisher(ImuData, '/IMU_DATA', 200)
         self.joints_pub = self.create_publisher(JointsData, '/JOINTS_DATA', 200)
@@ -392,6 +433,80 @@ class MuJoCoSimulationWaypointNode(Node):
     def wrap_to_pi(angle):
         return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
+    @staticmethod
+    def _lerp_angle(from_angle, to_angle, scale):
+        return from_angle + scale * MuJoCoSimulationWaypointNode.wrap_to_pi(to_angle - from_angle)
+
+    def _future_rand01(self) -> float:
+        self._future_point_rng_state = (self._future_point_rng_state * 1664525 + 1013904223) & 0xFFFFFFFF
+        return float(self._future_point_rng_state) / 4294967295.0
+
+    def _maybe_update_future_waypoints(self):
+        if not bool(WAYPOINT_CFG.get("future_point_update_enable", True)):
+            return
+        if self._future_point_update_interval_steps <= 0 or self.wp_total < 2:
+            return
+        if self.wp_idx >= self.wp_total - 1:
+            return
+        self._future_point_update_counter += 1
+        if (self._future_point_update_counter % self._future_point_update_interval_steps) != 0:
+            return
+        self._refresh_future_waypoints()
+
+    def _refresh_future_waypoints(self):
+        scale = float(np.clip(float(WAYPOINT_CFG.get("future_point_change_scale", 0.0)), 0.0, 1.0))
+        if scale <= 0.0:
+            return
+
+        start = int(np.clip(self.wp_idx, 1, self.wp_total - 1))
+        end = min(self.wp_total, start + 20)
+        prev_point = self.waypoints_xy[max(0, start - 1)].copy()
+        prev_heading_new = 0.0
+        if start >= 2:
+            prev_vec = self.waypoints_xy[start - 1] - self.waypoints_xy[start - 2]
+            prev_heading_new = float(np.arctan2(prev_vec[1], prev_vec[0]))
+
+        r_min = float(WAYPOINT_CFG["r_min"])
+        r_max = float(WAYPOINT_CFG["r_max"])
+        theta_min = float(WAYPOINT_CFG["theta_min"]) * 2.0 * np.pi
+        theta_max = float(WAYPOINT_CFG["theta_max"]) * 2.0 * np.pi
+
+        for point_idx in range(start, end):
+            old_vec = self.waypoints_xy[point_idx] - self.waypoints_xy[point_idx - 1]
+            old_r = max(float(np.linalg.norm(old_vec)), 1e-6)
+            old_heading = float(np.arctan2(old_vec[1], old_vec[0]))
+
+            rand_r = r_min + self._future_rand01() * (r_max - r_min)
+            new_r = float(np.clip(old_r + scale * (rand_r - old_r), r_min, r_max))
+
+            rand_heading = self._future_rand01() * 2.0 * np.pi
+            heading_case1 = self._lerp_angle(old_heading, rand_heading, scale)
+
+            old_prev_heading = 0.0
+            if point_idx >= 2:
+                old_prev_vec = self.waypoints_xy[point_idx - 1] - self.waypoints_xy[point_idx - 2]
+                old_prev_heading = float(np.arctan2(old_prev_vec[1], old_prev_vec[0]))
+            old_dtheta = self.wrap_to_pi(old_heading - old_prev_heading)
+            rand_dtheta = theta_min + self._future_rand01() * (theta_max - theta_min)
+            new_dtheta = float(np.clip(old_dtheta + scale * (rand_dtheta - old_dtheta), theta_min, theta_max))
+            heading_case2 = prev_heading_new + new_dtheta
+
+            new_heading = heading_case1 if point_idx == 1 else heading_case2
+            new_point = prev_point + new_r * np.array([np.cos(new_heading), np.sin(new_heading)], dtype=np.float32)
+            self.waypoints_xy[point_idx] = new_point.astype(np.float32)
+            prev_point = new_point
+            prev_heading_new = new_heading
+
+    def _maybe_advance_spin_waypoint(self):
+        if int(WAYPOINT_CFG.get("path_type", 0)) != 9 or self._spin_update_interval_steps <= 0:
+            return
+        if self.wp_total < 2 or self.wp_idx >= self.wp_total - 1:
+            return
+        self._spin_update_counter += 1
+        if (self._spin_update_counter % self._spin_update_interval_steps) != 0:
+            return
+        self.wp_idx = min(self.wp_idx + 1, self.wp_total - 1)
+
     def _generate_world_waypoints(self, origin_xy: np.ndarray, yaw0: float):
         path_type = int(WAYPOINT_CFG.get("path_type", 0))
 
@@ -477,20 +592,32 @@ class MuJoCoSimulationWaypointNode(Node):
 
         # When C++ waypoint data is active, do NOT advance wp_idx independently.
         # The C++ policy controls waypoint advancement via /WAYPOINT_PATH topic.
-        if (check_reach and not self._cpp_waypoint_active and
+        if (int(WAYPOINT_CFG.get("path_type", 0)) != 9 and check_reach and
+                not self._cpp_waypoint_active and not self.waypoint_finished and
                 dist < float(WAYPOINT_CFG["reach_threshold"])):
-            self.wp_idx = (self.wp_idx + 1) % self.wp_total
-            target = self.waypoints_xy[self.wp_idx]
-            delta = target - base_pos
-            dist = float(np.linalg.norm(delta))
-            self.get_logger().info(f"[WP] switch to #{self.wp_idx}: ({target[0]:.2f}, {target[1]:.2f})")
+            if self.wp_idx >= self.wp_total - 1:
+                self.waypoint_finished = True
+                self.get_logger().info("[WP] final waypoint reached; holding RL/autopilot mode")
+            else:
+                self.wp_idx = min(self.wp_idx + 1, self.wp_total - 1)
+                self._future_point_update_counter = 0
+                self._spin_update_counter = 0
+                target = self.waypoints_xy[self.wp_idx]
+                delta = target - base_pos
+                dist = float(np.linalg.norm(delta))
+                self.get_logger().info(f"[WP] switch to #{self.wp_idx}: ({target[0]:.2f}, {target[1]:.2f})")
 
-        desired_yaw = float(np.arctan2(delta[1], delta[0]))
-        yaw_err = self.wrap_to_pi(desired_yaw - yaw)
+        if wp_idx >= self.wp_total - 1 and dist < float(WAYPOINT_CFG["reach_threshold"]):
+            self.waypoint_finished = True
+
+        target_yaw = float(np.arctan2(delta[1], delta[0]))
+        hold_final_waypoint = self.waypoint_finished
+        desired_yaw = yaw if hold_final_waypoint else target_yaw
+        yaw_err = 0.0 if hold_final_waypoint else self.wrap_to_pi(desired_yaw - yaw)
 
         v_mag = np.clip(Kp_VXY * dist, 0.0, MAX_VXY)
-        vx_w = v_mag * np.cos(desired_yaw)
-        vy_w = v_mag * np.sin(desired_yaw)
+        vx_w = v_mag * np.cos(target_yaw)
+        vy_w = v_mag * np.sin(target_yaw)
         wz = np.clip(Kp_WZ * yaw_err, -MAX_WZ, MAX_WZ)
 
         # Soft velocity servo on free-base DOF: qvel[0]=vx, qvel[1]=vy, qvel[5]=wz
@@ -661,6 +788,9 @@ class MuJoCoSimulationWaypointNode(Node):
                 self._apply_fallback_stand_cmd_if_needed()
                 self._apply_joint_torque()
                 publish_pose_10hz = (step % 100 == 0)
+                if not self._cpp_waypoint_active:
+                    self._maybe_advance_spin_waypoint()
+                    self._maybe_update_future_waypoints()
                 self._autopilot_track_waypoint(step, publish_pose_10hz)
 
                 mujoco.mj_step(self.model, self.data)

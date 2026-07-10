@@ -146,11 +146,8 @@ namespace qw {
         virtual StateName GetNextStateName() {
             if (uc_ptr_->GetUserCommand()->safe_control_mode != 0) 
                 return StateName::kJointDamping;
-            if (m20_policy_ && m20_policy_->IsWaypointFinished()) {
-                uc_ptr_->GetUserCommand()->target_mode = uint8_t(RobotMotionState::StandingUp);
-                std::cout << "[RLControlState] Waypoint tracking finished -> Standing Up" << std::endl;
-                return StateName::kStandUp;
-            }
+            // Keep RL control active after the final waypoint. Operators can
+            // still leave RL manually via the normal keyboard/gamepad commands.
             if (uc_ptr_->GetUserCommand()->target_mode == uint8_t(RobotMotionState::StandingUp))
                 return StateName::kStandUp;
             if (uc_ptr_->GetUserCommand()->target_mode == uint8_t(RobotMotionState::LieDown))

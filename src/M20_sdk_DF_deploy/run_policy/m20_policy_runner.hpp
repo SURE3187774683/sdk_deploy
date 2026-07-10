@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <cstdlib>
 #include <functional>
+#include <algorithm>
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_c_api.h>
 
@@ -118,10 +119,14 @@ private:
         float reach_threshold = 0.05f;
         float target_z = 0.45f;
         int seed = 42;
+        bool future_point_update_enable = true;
+        float future_point_update_hz = 10.0f;
+        float future_point_change_scale = 0.0f;
         // ── Fixed-curve parameters ────────────────────────────────────────────
         // path_type: 0=random(随机)      1=figure-eight(8字形)  2=s-curve(S型)
         //            3=circle(圆形)      4=spiral(螺旋)         5=ellipse(椭圆)
         //            6=rose(玫瑰线)      7=trochoid(次摆线)        8=hypocycloid(内旋轮线)
+        //            9=spin-in-place(小半径绕身转圈展示)
         int   path_type           = 0;     // 0=random; 1-9=fixed curves
         float curve_scale         = 3.0f;  // 固定曲线整体尺寸(m)
         float point_spacing       = 0.2f;  // 等弧长采样间距(m), path_type>0 时有效
@@ -133,10 +138,20 @@ private:
         float trochoid_d_ratio    = 0.5f;  // 次摆线 d/R 比
         float hypocycloid_R_ratio = 4.0f;  // 内旋轮线 R/r 比
         float hypocycloid_d_ratio = 1.0f;  // 内旋轮线 d/r 比
+        float spin_radius         = 0.25f; // 原地转圈目标点半径(m)
+        float spin_num_turns      = 3.0f;  // 原地转圈圈数
+        float spin_point_spacing  = 0.03f; // 原地转圈点间距(m)
+        float spin_update_hz      = 12.0f; // 原地转圈目标点推进频率(Hz)
+        bool  spin_clockwise      = false; // true=顺时针, false=逆时针
     };
     WaypointPathConfig waypoint_cfg_;
     float ve_cycle_t_ = 0.0f;
     int ve_cycle_period_pts_ = 60;
+    int future_point_update_counter_ = 0;
+    int future_point_update_interval_steps_ = 1;
+    uint32_t future_point_rng_state_ = 1u;
+    int spin_update_counter_ = 0;
+    int spin_update_interval_steps_ = 1;
 
     static std::filesystem::path ResolveWaypointCfgPath() {
         if (const char* env_path = std::getenv("M20_WAYPOINT_CFG")) {
@@ -180,6 +195,9 @@ private:
                 else if (key == "reach_threshold") waypoint_cfg_.reach_threshold = std::stof(val);
                 else if (key == "target_z") waypoint_cfg_.target_z = std::stof(val);
                 else if (key == "seed")                waypoint_cfg_.seed                = std::stoi(val);
+                else if (key == "future_point_update_enable") waypoint_cfg_.future_point_update_enable = (val == "1" || val == "true" || val == "True" || val == "TRUE");
+                else if (key == "future_point_update_hz") waypoint_cfg_.future_point_update_hz = std::stof(val);
+                else if (key == "future_point_change_scale") waypoint_cfg_.future_point_change_scale = std::stof(val);
                 else if (key == "path_type")           waypoint_cfg_.path_type           = std::stoi(val);
                 else if (key == "curve_scale")         waypoint_cfg_.curve_scale         = std::stof(val);
                 else if (key == "point_spacing")       waypoint_cfg_.point_spacing       = std::stof(val);
@@ -191,6 +209,11 @@ private:
                 else if (key == "trochoid_d_ratio")    waypoint_cfg_.trochoid_d_ratio    = std::stof(val);
                 else if (key == "hypocycloid_R_ratio") waypoint_cfg_.hypocycloid_R_ratio = std::stof(val);
                 else if (key == "hypocycloid_d_ratio") waypoint_cfg_.hypocycloid_d_ratio = std::stof(val);
+                else if (key == "spin_radius")         waypoint_cfg_.spin_radius         = std::stof(val);
+                else if (key == "spin_num_turns")      waypoint_cfg_.spin_num_turns      = std::stof(val);
+                else if (key == "spin_point_spacing")  waypoint_cfg_.spin_point_spacing  = std::stof(val);
+                else if (key == "spin_update_hz")      waypoint_cfg_.spin_update_hz      = std::stof(val);
+                else if (key == "spin_clockwise")      waypoint_cfg_.spin_clockwise      = (val == "1" || val == "true" || val == "True" || val == "TRUE");
             } catch (const std::exception&) {
                 std::cerr << "[M20PolicyRunner] Invalid cfg item: " << line << std::endl;
             }
@@ -205,6 +228,15 @@ private:
             }
         }
         waypoint_reach_threshold_ = waypoint_cfg_.reach_threshold;
+        future_point_update_interval_steps_ = (waypoint_cfg_.future_point_update_hz > 0.0f && agent_timestep > 0.0f)
+            ? std::max(1, static_cast<int>(std::round(1.0f / (waypoint_cfg_.future_point_update_hz * agent_timestep))))
+            : 0;
+        future_point_rng_state_ = (waypoint_cfg_.seed >= 0)
+            ? static_cast<uint32_t>(waypoint_cfg_.seed) ^ 0x9e3779b9u
+            : static_cast<uint32_t>(std::time(nullptr)) ^ 0x9e3779b9u;
+        spin_update_interval_steps_ = (waypoint_cfg_.spin_update_hz > 0.0f && agent_timestep > 0.0f)
+            ? std::max(1, static_cast<int>(std::round(1.0f / (waypoint_cfg_.spin_update_hz * agent_timestep))))
+            : 0;
         std::cout << "[M20PolicyRunner] Waypoint cfg loaded from " << cfg_path
                   << " (num_waypoints=" << waypoint_cfg_.num_waypoints
                   << ", path_type=" << waypoint_cfg_.path_type
@@ -212,6 +244,9 @@ private:
                   << ", theta=[" << waypoint_cfg_.theta_min << "," << waypoint_cfg_.theta_max << "]"
                   << ", obs_num_points=" << waypoint_cfg_.obs_num_points
                   << ", seed=" << waypoint_cfg_.seed
+                  << ", future_update=" << (waypoint_cfg_.future_point_update_enable ? "true" : "false")
+                  << ", future_update_hz=" << waypoint_cfg_.future_point_update_hz
+                  << ", future_change_scale=" << waypoint_cfg_.future_point_change_scale
                   << ", curve_scale=" << waypoint_cfg_.curve_scale
                   << ", point_spacing=" << waypoint_cfg_.point_spacing << ")" << std::endl;
         return true;
@@ -223,6 +258,12 @@ private:
     }
     static float Rand01(uint32_t& state) {
         return static_cast<float>(NextLcg(state)) / 4294967295.0f;
+    }
+    static float WrapAngle(float angle) {
+        return std::atan2(std::sin(angle), std::cos(angle));
+    }
+    static float LerpAngle(float from, float to, float scale) {
+        return from + scale * WrapAngle(to - from);
     }
     int RandInt(uint32_t& state, int lo, int hi) {
         if (hi < lo) hi = lo;
@@ -297,6 +338,7 @@ private:
 
         std::function<Eigen::Vector2f(float)> curve_fn;
         float t_start = 0.0f, t_end = 2.0f * kPi;
+        std::vector<Eigen::Vector2f> raw;
 
         switch (waypoint_cfg_.path_type) {
             // ── 1. 8字形 (Figure-Eight, Lissajous) ─────────────────────────────
@@ -396,6 +438,22 @@ private:
                 };
                 break;
             }
+            // ── 9. 原地转圈展示 (Spin-in-place target ring) ─────────────────
+            case 9: {
+                const float radius = std::max(0.02f, waypoint_cfg_.spin_radius);
+                const float spin_spacing = std::max(0.005f, waypoint_cfg_.spin_point_spacing);
+                const float turns = std::max(0.25f, waypoint_cfg_.spin_num_turns);
+                const float direction = waypoint_cfg_.spin_clockwise ? -1.0f : 1.0f;
+                const float total_angle = turns * 2.0f * kPi;
+                const int n_pts = std::max(4, static_cast<int>(std::ceil(radius * total_angle / spin_spacing)) + 1);
+                raw.reserve(static_cast<size_t>(n_pts + 1));
+                raw.emplace_back(0.0f, 0.0f);
+                for (int i = 0; i < n_pts; ++i) {
+                    const float a = direction * total_angle * static_cast<float>(i) / static_cast<float>(std::max(1, n_pts - 1));
+                    raw.emplace_back(radius * std::cos(a), radius * std::sin(a));
+                }
+                break;
+            }
             default: {
                 std::cerr << "[M20PolicyRunner] Unknown path_type="
                           << waypoint_cfg_.path_type
@@ -405,7 +463,9 @@ private:
         } // switch
 
         // — Equal arc-length sampling —
-        auto raw = EqualArcLengthSample(curve_fn, t_start, t_end, spacing);
+        if (raw.empty()) {
+            raw = EqualArcLengthSample(curve_fn, t_start, t_end, spacing);
+        }
         if (raw.empty()) return;
 
         // — Translate so first sampled point is at origin —
@@ -487,6 +547,98 @@ private:
         }
     }
 
+    void ResetFutureWaypointUpdateState() {
+        future_point_update_counter_ = 0;
+        spin_update_counter_ = 0;
+        future_point_rng_state_ = (waypoint_cfg_.seed >= 0)
+            ? static_cast<uint32_t>(waypoint_cfg_.seed) ^ 0x9e3779b9u
+            : static_cast<uint32_t>(std::time(nullptr)) ^ 0x9e3779b9u;
+    }
+
+    void MaybeUpdateFutureWaypoints() {
+        if (!waypoint_cfg_.future_point_update_enable || future_point_update_interval_steps_ <= 0) {
+            return;
+        }
+        if (!waypoint_origin_initialized_) {
+            return;
+        }
+        if (waypoints_xy_.size() < 2 || waypoint_idx_ >= static_cast<int>(waypoints_xy_.size()) - 1) {
+            return;
+        }
+        ++future_point_update_counter_;
+        if ((future_point_update_counter_ % future_point_update_interval_steps_) != 0) {
+            return;
+        }
+        RefreshFutureWaypoints();
+    }
+
+    void MaybeAdvanceSpinWaypoint() {
+        if (waypoint_cfg_.path_type != 9 || spin_update_interval_steps_ <= 0 || waypoint_finished_) {
+            return;
+        }
+        if (waypoint_idx_ >= static_cast<int>(waypoints_xy_.size()) - 1) {
+            waypoint_finished_ = true;
+            return;
+        }
+        ++spin_update_counter_;
+        if ((spin_update_counter_ % spin_update_interval_steps_) != 0) {
+            return;
+        }
+        waypoint_idx_ = std::min(waypoint_idx_ + 1, static_cast<int>(waypoints_xy_.size()) - 1);
+    }
+
+    void RefreshFutureWaypoints() {
+        const float scale = std::clamp(waypoint_cfg_.future_point_change_scale, 0.0f, 1.0f);
+        if (scale <= 0.0f) {
+            return;
+        }
+
+        const int max_future_points = 20;
+        const int max_wp = static_cast<int>(waypoints_xy_.size());
+        const int start = waypoint_idx_;
+        const int end = std::min(max_wp, start + max_future_points);
+        if (start >= end) {
+            return;
+        }
+
+        Eigen::Vector2f prev_point = waypoints_xy_[std::max(0, start - 1)];
+        float prev_heading_new = 0.0f;
+        if (start >= 2) {
+            const Eigen::Vector2f prev_vec = waypoints_xy_[start - 1] - waypoints_xy_[start - 2];
+            prev_heading_new = std::atan2(prev_vec.y(), prev_vec.x());
+        }
+
+        const float theta_min = waypoint_cfg_.theta_min * 2.0f * static_cast<float>(M_PI);
+        const float theta_max = waypoint_cfg_.theta_max * 2.0f * static_cast<float>(M_PI);
+        for (int point_idx = start; point_idx < end; ++point_idx) {
+            const Eigen::Vector2f old_vec = waypoints_xy_[point_idx] - waypoints_xy_[point_idx - 1];
+            const float old_r = std::max(old_vec.norm(), 1e-6f);
+            const float old_heading = std::atan2(old_vec.y(), old_vec.x());
+
+            const float rand_r = waypoint_cfg_.r_min + Rand01(future_point_rng_state_) * (waypoint_cfg_.r_max - waypoint_cfg_.r_min);
+            const float new_r = std::clamp(old_r + scale * (rand_r - old_r), waypoint_cfg_.r_min, waypoint_cfg_.r_max);
+
+            const float rand_heading = Rand01(future_point_rng_state_) * 2.0f * static_cast<float>(M_PI);
+            const float heading_case1 = LerpAngle(old_heading, rand_heading, scale);
+
+            float old_prev_heading = 0.0f;
+            if (point_idx >= 2) {
+                const Eigen::Vector2f old_prev_vec = waypoints_xy_[point_idx - 1] - waypoints_xy_[point_idx - 2];
+                old_prev_heading = std::atan2(old_prev_vec.y(), old_prev_vec.x());
+            }
+            const float old_dtheta = WrapAngle(old_heading - old_prev_heading);
+            const float rand_dtheta = theta_min + Rand01(future_point_rng_state_) * (theta_max - theta_min);
+            const float new_dtheta = std::clamp(old_dtheta + scale * (rand_dtheta - old_dtheta), theta_min, theta_max);
+            const float heading_case2 = prev_heading_new + new_dtheta;
+
+            const float new_heading = (point_idx == 1) ? heading_case1 : heading_case2;
+            const Eigen::Vector2f new_point = prev_point + new_r * Eigen::Vector2f(std::cos(new_heading), std::sin(new_heading));
+            waypoints_xy_[point_idx] = new_point;
+            prev_point = new_point;
+            prev_heading_new = new_heading;
+        }
+    }
+
 public:
     M20PolicyRunner(const std::string &policy_name, const std::string &policy_path) :
             PolicyRunnerBase(policy_name), policy_path_(policy_path),env_(ORT_LOGGING_LEVEL_WARNING, "M20PolicyRunner"),
@@ -545,6 +697,7 @@ public:
             throw std::runtime_error("Failed to load waypoint path config");
         }
         GenerateWaypoints();
+        ResetFutureWaypointUpdateState();
     }
 
     ~M20PolicyRunner() override = default;
@@ -593,6 +746,7 @@ public:
         waypoint_origin_xy_.setZero();
         waypoint_origin_yaw_ = 0.0f;
         GenerateWaypoints();
+        ResetFutureWaypointUpdateState();
         cmd_vel_input_.setZero();
         last_action_eigen.setZero(action_dim);
         tmp_action_eigen.setZero(action_dim);
@@ -622,6 +776,7 @@ public:
             waypoint_origin_yaw_ = ro.base_rpy(2);
             waypoint_origin_initialized_ = true;
             GenerateWaypoints(waypoint_origin_yaw_);
+            ResetFutureWaypointUpdateState();
             waypoint_idx_ = 1;
             std::cout << "[M20PolicyRunner] Waypoint origin set to ("
                     << waypoint_origin_xy_(0) << ", " << waypoint_origin_xy_(1)
@@ -634,12 +789,14 @@ public:
             }
 }
 
+        MaybeAdvanceSpinWaypoint();
+
         const Eigen::Vector2f &local_wp = waypoints_xy_[waypoint_idx_];
         Eigen::Vector2f target_xy = LocalWaypointToWorld(local_wp);
         Eigen::Vector2f delta_w = target_xy - base_xy;
         float dist = delta_w.norm();
         last_waypoint_reached_ = false;
-        if (!waypoint_finished_ && dist < waypoint_reach_threshold_) {
+        if (waypoint_cfg_.path_type != 9 && !waypoint_finished_ && dist < waypoint_reach_threshold_) {
             const int reached_idx = waypoint_idx_;
             const int last_idx = static_cast<int>(waypoints_xy_.size()) - 1;
             waypoint_finished_ = (waypoint_idx_ >= last_idx);
@@ -654,9 +811,6 @@ public:
             //           << " base_xy=(" << base_xy(0) << "," << base_xy(1) << ")"
             //           << " target_xy=(" << target_xy(0) << "," << target_xy(1) << ")"
             //           << std::endl;
-            if (waypoint_finished_) {
-                return Vec4f::Zero();
-            }
             const Eigen::Vector2f &local_wp_next = waypoints_xy_[waypoint_idx_];
             target_xy = LocalWaypointToWorld(local_wp_next);
             delta_w = target_xy - base_xy;
@@ -672,8 +826,9 @@ public:
         const float dx_b = cy * delta_w(0) + sy * delta_w(1);
         const float dy_b = -sy * delta_w(0) + cy * delta_w(1);
         const float dz_b = waypoint_cfg_.target_z - ro.base_pos_w(2);
-        const float desired_heading_w = std::atan2(delta_w(1), delta_w(0));
-        const float dheading = WrapToPi(desired_heading_w - yaw);
+        const bool hold_final_waypoint = waypoint_finished_;
+        const float desired_heading_w = hold_final_waypoint ? yaw : std::atan2(delta_w(1), delta_w(0));
+        const float dheading = hold_final_waypoint ? 0.0f : WrapToPi(desired_heading_w - yaw);
 
         return Vec4f(dx_b, dy_b, dz_b, dheading);
     }
@@ -695,9 +850,12 @@ public:
             const float dx_b = cy * delta_w(0) + sy * delta_w(1);
             const float dy_b = -sy * delta_w(0) + cy * delta_w(1);
             const float dz_b = waypoint_cfg_.target_z - ro.base_pos_w(2);
-            const float desired_heading_w = std::atan2(delta_w(1), delta_w(0));
-            const float dheading = WrapToPi(desired_heading_w - yaw);
-            const float point_move_vE = (idx >= 0 && idx < static_cast<int>(waypoints_vE_.size())) ? waypoints_vE_[idx] : 0.0f;
+            const bool hold_final_waypoint = waypoint_finished_;
+            const float desired_heading_w = hold_final_waypoint ? yaw : std::atan2(delta_w(1), delta_w(0));
+            const float dheading = hold_final_waypoint ? 0.0f : WrapToPi(desired_heading_w - yaw);
+            const float point_move_vE = (waypoint_finished_ || idx < 0 || idx >= static_cast<int>(waypoints_vE_.size()))
+                ? 0.0f
+                : waypoints_vE_[idx];
             const int off = i * 5;
             out(off + 0) = dx_b;
             out(off + 1) = dy_b;
@@ -742,6 +900,7 @@ public:
                            const VecXf& joint_vel_rl,
                            const VecXf& last_action_eigen) {
         VecXf obs(observation_dim_);
+        MaybeUpdateFutureWaypoints();
         last_waypoint_cmd_ = BuildWaypointCommand(ro);
         VecXf waypoint_obs = BuildFutureWaypointObservation(ro);
         obs << base_omgea,
